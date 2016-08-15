@@ -7,7 +7,7 @@ from django.conf import settings
 from django.core.management.commands.runserver import \
     Command as RunserverCommand
 from django.utils import six
-from django.utils.encoding import get_system_encoding
+from django.utils.encoding import DEFAULT_LOCALE_ENCODING
 
 from channels import DEFAULT_CHANNEL_LAYER, channel_layers
 from channels.handler import ViewConsumer
@@ -41,13 +41,13 @@ class Command(RunserverCommand):
         )
         # Run checks
         self.stdout.write("Performing system checks...\n\n")
-        self.check(display_num_errors=True)
-        self.check_migrations()
+        self.validate(display_num_errors=True)
+        #self.check_migrations()
         # Print helpful text
         quit_command = 'CTRL-BREAK' if sys.platform == 'win32' else 'CONTROL-C'
         now = datetime.datetime.now().strftime('%B %d, %Y - %X')
         if six.PY2:
-            now = now.decode(get_system_encoding())
+            now = now.decode(DEFAULT_LOCALE_ENCODING)
         self.stdout.write(now)
         self.stdout.write((
             "Django version %(version)s, using settings %(settings)r\n"

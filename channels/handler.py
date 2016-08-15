@@ -13,7 +13,8 @@ from django.conf import settings
 from django.core import signals
 from django.core.handlers import base
 from django.core.urlresolvers import set_script_prefix
-from django.http import FileResponse, HttpResponse, HttpResponseServerError
+from django.http import HttpResponseSendFile, HttpResponse, HttpResponseServerError
+from django.utils import datastructures
 from django.utils import six
 from django.utils.functional import cached_property
 
@@ -158,8 +159,13 @@ class AsgiRequest(http.HttpRequest):
 
     @cached_property
     def COOKIES(self):
-        return http.parse_cookie(self.META.get('HTTP_COOKIE', ''))
+        return http.parse_cookie(str(self.META.get('HTTP_COOKIE', '')))
 
+    def _get_request(self):
+        if not hasattr(self, '_request'):
+            self._request = datastructures.MergeDict(self.POST, self.GET)
+        return self._request
+    REQUEST = property(_get_request)
 
 class AsgiHandler(base.BaseHandler):
     """
@@ -203,7 +209,7 @@ class AsgiHandler(base.BaseHandler):
             try:
                 response = self.get_response(request)
                 # Fix chunk size on file responses
-                if isinstance(response, FileResponse):
+                if isinstance(response, HttpResponseSendFile):
                     response.block_size = 1024 * 512
             except AsgiRequest.ResponseLater:
                 # The view has promised something else
@@ -277,7 +283,7 @@ class AsgiHandler(base.BaseHandler):
             "headers": response_headers,
         }
         # Streaming responses need to be pinned to their iterator
-        if response.streaming:
+        if isinstance(response, HttpResponseSendFile):
             # Access `__iter__` and not `streaming_content` directly in case
             # it has been overridden in a subclass.
             for part in response:
