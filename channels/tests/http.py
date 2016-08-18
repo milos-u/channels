@@ -1,12 +1,14 @@
 import json
 import copy
 
-from django.apps import apps
+#from django.apps import apps
 from django.conf import settings
 
 from ..sessions import session_for_reply_channel
 from .base import Client
 
+def app_is_installed(name):
+	return name in settings.INSTALLED_APPS
 
 class HttpClient(Client):
     """
@@ -37,7 +39,7 @@ class HttpClient(Client):
     def get_cookies(self):
         """Return cookies"""
         cookies = copy.copy(self._cookies)
-        if apps.is_installed('django.contrib.sessions'):
+        if app_is_installed('django.contrib.sessions'):
             cookies[settings.SESSION_COOKIE_NAME] = self.session.session_key
         return cookies
 
@@ -50,7 +52,7 @@ class HttpClient(Client):
     @property
     def session(self):
         """Session as Lazy property: check that django.contrib.sessions is installed"""
-        if not apps.is_installed('django.contrib.sessions'):
+        if not app_is_installed('django.contrib.sessions'):
             raise EnvironmentError('Add django.contrib.sessions to the INSTALLED_APPS to use session')
         if not self._session:
             self._session = session_for_reply_channel(self.reply_channel)
@@ -83,7 +85,7 @@ class HttpClient(Client):
         """
         from django.contrib.auth import authenticate
         user = authenticate(**credentials)
-        if user and user.is_active and apps.is_installed('django.contrib.sessions'):
+        if user and user.is_active and app_is_installed('django.contrib.sessions'):
             self._login(user)
             return True
         else:
