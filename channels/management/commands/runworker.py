@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+from optparse import make_option
+
 from django.conf import settings
 from django.core.management import BaseCommand, CommandError
 
@@ -14,20 +16,24 @@ class Command(BaseCommand):
 
     leave_locale_alone = True
 
-    def add_arguments(self, parser):
-        super(Command, self).add_arguments(parser)
-        parser.add_argument(
+    option_list = BaseCommand.option_list + (
+        make_option(
             '--layer', action='store', dest='layer', default=DEFAULT_CHANNEL_LAYER,
             help='Channel layer alias to use, if not the default.',
-        )
-        parser.add_argument(
+        ),
+        make_option(
             '--only-channels', action='append', dest='only_channels',
             help='Limits this worker to only listening on the provided channels (supports globbing).',
-        )
-        parser.add_argument(
+        ),
+        make_option(
             '--exclude-channels', action='append', dest='exclude_channels',
             help='Prevents this worker from listening on the provided channels (supports globbing).',
-        )
+        ),
+        make_option(
+            '--num-threads', action='store', dest='num_threads', default=1,
+            help='Number of worker threads to start. Default: 1.',
+        ),
+    )
 
     def handle(self, *args, **options):
         # Get the backend to use
@@ -53,15 +59,19 @@ class Command(BaseCommand):
         if self.verbosity > 1:
             callback = self.consumer_called
         # Run the worker
+        num_threads = int(options.get("num_threads", 1))
         try:
-            worker = Worker(
-                channel_layer=self.channel_layer,
-                callback=callback,
-                only_channels=options.get("only_channels", None),
-                exclude_channels=options.get("exclude_channels", None),
-            )
-            worker_ready.send(sender=worker)
-            worker.run()
+            for i in range(0, num_threads):
+                worker = Worker(
+                    channel_layer=self.channel_layer,
+                    callback=callback,
+                    only_channels=options.get("only_channels", None),
+                    exclude_channels=options.get("exclude_channels", None),
+                )
+                worker_ready.send(sender=worker)
+                if i > 0:
+                    worker.daemon = True
+                worker.run()
         except KeyboardInterrupt:
             pass
 
