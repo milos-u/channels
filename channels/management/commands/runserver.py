@@ -2,6 +2,8 @@ import datetime
 import sys
 import threading
 
+from optparse import make_option
+
 from daphne.server import Server
 from django.conf import settings
 from django.core.management.commands.runserver import \
@@ -18,12 +20,12 @@ from channels.worker import Worker
 
 class Command(RunserverCommand):
 
-    def add_arguments(self, parser):
-        super(Command, self).add_arguments(parser)
-        parser.add_argument('--noworker', action='store_false', dest='run_worker', default=True,
-            help='Tells Django not to run a worker thread; you\'ll need to run one separately.')
-        parser.add_argument('--noasgi', action='store_false', dest='use_asgi', default=True,
+    option_list = RunserverCommand.option_list + (
+        make_option('--noworker', action='store_false', dest='run_worker', default=True,
+            help='Tells Django not to run a worker thread; you\'ll need to run one separately.'),
+        make_option('--noasgi', action='store_false', dest='use_asgi', default=True,
             help='Run the old WSGI-based runserver rather than the ASGI-based one')
+    )
 
     def handle(self, *args, **options):
         self.verbosity = options.get("verbosity", 1)
