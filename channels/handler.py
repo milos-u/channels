@@ -130,6 +130,8 @@ class AsgiRequest(http.HttpRequest):
                 if not chunk.get("more_content", False):
                     break
         assert isinstance(self._body, six.binary_type), "Body is not bytes"
+        if self.META.has_key('CONTENT_TYPE'):
+            self.META['CONTENT_TYPE'] = str(self.META['CONTENT_TYPE'])
         # Add a stream-a-like for the body
         self._stream = BytesIO(self._body)
         # Other bits
