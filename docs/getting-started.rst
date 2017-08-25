@@ -11,7 +11,7 @@ patterns and caveats.
 First Consumers
 ---------------
 
-When you run Django out of the box, it will be set up in the default layout -
+When you first run Django with Channels installed, it will be set up in the default layout -
 where all HTTP requests (on the ``http.request`` channel) are routed to the
 Django view layer - nothing will be different to how things worked in the past
 with a WSGI-based Django, and your views and static file serving (from
@@ -105,7 +105,7 @@ for ``http.request`` - and make this WebSocket consumer instead::
 
     def ws_message(message):
         # ASGI WebSocket packet-received and send-packet message types
-        # both have a "text" key for their textual data. 
+        # both have a "text" key for their textual data.
         message.reply_channel.send({
             "text": message.content['text'],
         })
@@ -128,9 +128,13 @@ When it gets that message, it takes the ``reply_channel`` attribute from it, whi
 is the unique response channel for that client, and sends the same content
 back to the client using its ``send()`` method.
 
-Let's test it! Run ``runserver``, open a browser and put the following into the
-JavaScript console to open a WebSocket and send some data down it (you might
-need to change the socket address if you're using a development VM or similar)::
+Let's test it! Run ``runserver``, open a browser, navigate to a page on the server
+(you can't use any page's console because of origin restrictions), and put the
+following into the JavaScript console to open a WebSocket and send some data
+down it (you might need to change the socket address if you're using a
+development VM or similar)
+
+.. code-block:: javascript
 
     // Note that the path doesn't matter for routing; any WebSocket
     // connection gets bumped over to WebSocket consumers
@@ -141,6 +145,8 @@ need to change the socket address if you're using a development VM or similar)::
     socket.onopen = function() {
         socket.send("hello world");
     }
+    // Call onopen directly if socket is already open
+    if (socket.readyState == WebSocket.OPEN) socket.onopen();
 
 You should see an alert come back immediately saying "hello world" - your
 message has round-tripped through the server and come back to trigger the alert.
@@ -161,11 +167,19 @@ disconnect, like this::
 
     # Connected to websocket.connect
     def ws_add(message):
+        # Accept the incoming connection
+        message.reply_channel.send({"accept": True})
+        # Add them to the chat group
         Group("chat").add(message.reply_channel)
 
     # Connected to websocket.disconnect
     def ws_disconnect(message):
         Group("chat").discard(message.reply_channel)
+
+.. note::
+    You need to explicitly accept WebSocket connections if you override connect
+    by sending ``accept: True`` - you can also reject them at connection time,
+    before they open, by sending ``close: True``.
 
 Of course, if you've read through :doc:`concepts`, you'll know that channels
 added to groups expire out if their messages expire (every channel layer has
@@ -199,6 +213,9 @@ get the message. Here's all the code::
 
     # Connected to websocket.connect
     def ws_add(message):
+        # Accept the connection
+        message.reply_channel.send({"accept": True})
+        # Add to the chat group
         Group("chat").add(message.reply_channel)
 
     # Connected to websocket.receive
@@ -222,9 +239,18 @@ And what our routing should look like in ``routing.py``::
         route("websocket.disconnect", ws_disconnect),
     ]
 
+Note that the ``http.request`` route is no longer present - if we leave it
+out, then Django will route HTTP requests to the normal view system by default,
+which is probably what you want. Even if you have a ``http.request`` route that
+matches just a subset of paths or methods, the ones that don't match will still
+fall through to the default handler, which passes it into URL routing and the
+views.
+
 With all that code, you now have a working set of a logic for a chat server.
 Test time! Run ``runserver``, open a browser and use that same JavaScript
-code in the developer console as before::
+code in the developer console as before
+
+.. code-block:: javascript
 
     // Note that the path doesn't matter right now; any WebSocket
     // connection gets bumped over to WebSocket consumers
@@ -235,6 +261,8 @@ code in the developer console as before::
     socket.onopen = function() {
         socket.send("hello world");
     }
+    // Call onopen directly if socket is already open
+    if (socket.readyState == WebSocket.OPEN) socket.onopen();
 
 You should see an alert come back immediately saying "hello world" - but this
 time, you can open another tab and do the same there, and both tabs will
@@ -309,6 +337,12 @@ and set up your channel layer like this::
         },
     }
 
+You'll also need to install the Redis server - there are downloads available
+for Mac OS and Windows, and it's in pretty much every linux distribution's
+package manager. For example, on Ubuntu, you can just::
+
+    sudo apt-get install redis-server
+
 Fire up ``runserver``, and it'll work as before - unexciting, like good
 infrastructure should be. You can also try out the cross-process nature; run
 these two commands in two terminals:
@@ -330,7 +364,7 @@ Persisting Data
 Echoing messages is a nice simple example, but it's ignoring the real
 need for a system like this - persistent state for connections.
 Let's consider a basic chat site where a user requests a chat room upon initial
-connection, as part of the query string (e.g. ``wss://host/websocket?room=abc``).
+connection, as part of the URL path (e.g. ``wss://host/rooms/room-name``).
 
 The ``reply_channel`` attribute you've seen before is our unique pointer to the
 open WebSocket - because it varies between different clients, it's how we can
@@ -348,32 +382,41 @@ provides you with an attribute called ``message.channel_session`` that acts
 just like a normal Django session.
 
 Let's use it now to build a chat server that expects you to pass a chatroom
-name in the path of your WebSocket request (we'll ignore auth for now - that's next)::
+name in the path of your WebSocket request and a query string with your username (we'll ignore auth for now - that's next)::
 
     # In consumers.py
     from channels import Group
     from channels.sessions import channel_session
+    from urllib.parse import parse_qs
 
     # Connected to websocket.connect
     @channel_session
-    def ws_connect(message):
-        # Work out room name from path (ignore slashes)
-        room = message.content['path'].strip("/")
-        # Save room in session and add us to the group
-        message.channel_session['room'] = room
-        Group("chat-%s" % room).add(message.reply_channel)
+    def ws_connect(message, room_name):
+        # Accept connection
+        message.reply_channel.send({"accept": True})
+        # Parse the query string
+        params = parse_qs(message.content["query_string"])
+        if "username" in params:
+            # Set the username in the session
+            message.channel_session["username"] = params["username"]
+            # Add the user to the room_name group
+            Group("chat-%s" % room_name).add(message.reply_channel)
+        else:
+            # Close the connection.
+            message.reply_channel.send({"close": True})
 
     # Connected to websocket.receive
     @channel_session
-    def ws_message(message):
-        Group("chat-%s" % message.channel_session['room']).send({
-            "text": message['text'],
+    def ws_message(message, room_name):
+        Group("chat-%s" % room_name).send({
+            "text": message["text"],
+            "username": message.channel_session["username"]
         })
 
     # Connected to websocket.disconnect
     @channel_session
-    def ws_disconnect(message):
-        Group("chat-%s" % message.channel_session['room']).discard(message.reply_channel)
+    def ws_disconnect(message, room_name):
+        Group("chat-%s" % room_name).discard(message.reply_channel)
 
 Update ``routing.py`` as well::
 
@@ -382,9 +425,9 @@ Update ``routing.py`` as well::
     from myapp.consumers import ws_connect, ws_message, ws_disconnect
 
     channel_routing = [
-        route("websocket.connect", ws_connect),
-        route("websocket.receive", ws_message),
-        route("websocket.disconnect", ws_disconnect),
+        route("websocket.connect", ws_connect, path=r"^/(?P<room_name>[a-zA-Z0-9_]+)/$"),
+        route("websocket.receive", ws_message, path=r"^/(?P<room_name>[a-zA-Z0-9_]+)/$"),
+        route("websocket.disconnect", ws_disconnect, path=r"^/(?P<room_name>[a-zA-Z0-9_]+)/$"),
     ]
 
 If you play around with it from the console (or start building a simple
@@ -422,10 +465,10 @@ both authentication and getting the underlying Django session (which is what
 Django authentication relies on).
 
 Channels can use Django sessions either from cookies (if you're running your
-websocket server on the same port as your main site, using something like Daphne),
-or from a ``session_key`` GET parameter, which is works if you want to keep
+websocket server on the same domain as your main site, using something like Daphne),
+or from a ``session_key`` GET parameter, which works if you want to keep
 running your HTTP requests through a WSGI server and offload WebSockets to a
-second server process on another port.
+second server process on another domain.
 
 You get access to a user's normal Django session using the ``http_session``
 decorator - that gives you a ``message.http_session`` attribute that behaves
@@ -451,11 +494,13 @@ chat to people with the same first letter of their username::
     # In consumers.py
     from channels import Channel, Group
     from channels.sessions import channel_session
-    from channels.auth import http_session_user, channel_session_user, channel_session_user_from_http
+    from channels.auth import channel_session_user, channel_session_user_from_http
 
     # Connected to websocket.connect
     @channel_session_user_from_http
     def ws_add(message):
+        # Accept connection
+        message.reply_channel.send({"accept": True})
         # Add them to the right group
         Group("chat-%s" % message.user.username[0]).add(message.reply_channel)
 
@@ -473,8 +518,10 @@ chat to people with the same first letter of their username::
 
 If you're just using ``runserver`` (and so Daphne), you can just connect
 and your cookies should transfer your auth over. If you were running WebSockets
-on a separate port, you'd have to remember to provide the
-Django session ID as part of the URL, like this::
+on a separate domain, you'd have to remember to provide the
+Django session ID as part of the URL, like this
+
+.. code-block:: javascript
 
     socket = new WebSocket("ws://127.0.0.1:9000/?session_key=abcdefg");
 
@@ -482,6 +529,51 @@ You can get the current session key in a template with ``{{ request.session.sess
 Note that this can't work with signed cookie sessions - since only HTTP
 responses can set cookies, it needs a backend it can write to to separately
 store state.
+
+
+Security
+--------
+
+Unlike AJAX requests, WebSocket requests are not limited by the Same-Origin
+policy. This means you don't have to take any extra steps when you have an HTML
+page served by host A containing JavaScript code wanting to connect to a
+WebSocket on Host B.
+
+While this can be convenient, it also implies that by default any third-party
+site can connect to your WebSocket application. When you are using the
+``http_session_user`` or the ``channel_session_user_from_http`` decorator, this
+connection would be authenticated.
+
+The WebSocket specification requires browsers to send the origin of a WebSocket
+request in the HTTP header named ``Origin``, but validating that header is left
+to the server.
+
+You can use the decorator ``channels.security.websockets.allowed_hosts_only``
+on a ``websocket.connect`` consumer to only allow requests originating
+from hosts listed in the ``ALLOWED_HOSTS`` setting::
+
+    # In consumers.py
+    from channels import Channel, Group
+    from channels.sessions import channel_session
+    from channels.auth import channel_session_user, channel_session_user_from_http
+    from channels.security.websockets import allowed_hosts_only.
+
+    # Connected to websocket.connect
+    @allowed_hosts_only
+    @channel_session_user_from_http
+    def ws_add(message):
+        # Accept connection
+        ...
+
+Requests from other hosts or requests with missing or invalid origin header
+are now rejected.
+
+The name ``allowed_hosts_only`` is an alias for the class-based decorator
+``AllowedHostsOnlyOriginValidator``, which inherits from
+``BaseOriginValidator``. If you have custom requirements for origin validation,
+create a subclass and overwrite the method
+``validate_origin(self, message, origin)``. It must return True when a message
+should be accepted, False otherwise.
 
 
 Routing
@@ -506,7 +598,7 @@ routing our chat from above::
     ]
 
     chat_routing = [
-        route("websocket.connect", chat_connect, path=r"^/(?P<room>[a-zA-Z0-9_]+)/$),
+        route("websocket.connect", chat_connect, path=r"^/(?P<room_name>[a-zA-Z0-9_]+)/$"),
         route("websocket.disconnect", chat_disconnect),
     ]
 
@@ -531,11 +623,13 @@ consumer above to use a room based on URL rather than username::
 
     # Connected to websocket.connect
     @channel_session_user_from_http
-    def ws_add(message, room):
+    def ws_add(message, room_name):
         # Add them to the right group
-        Group("chat-%s" % room).add(message.reply_channel)
+        Group("chat-%s" % room_name).add(message.reply_channel)
+        # Accept the connection request
+        message.reply_channel.send({"accept": True})
 
-In the next section, we'll change to sending the ``room`` as a part of the
+In the next section, we'll change to sending the ``room_name`` as a part of the
 WebSocket message - which you might do if you had a multiplexing client -
 but you could use routing there as well.
 
@@ -589,13 +683,15 @@ have a ChatMessage model with ``message`` and ``room`` fields::
         # Save room in session and add us to the group
         message.channel_session['room'] = room
         Group("chat-%s" % room).add(message.reply_channel)
+        # Accept the connection request
+        message.reply_channel.send({"accept": True})
 
     # Connected to websocket.receive
     @channel_session
     def ws_message(message):
         # Stick the message onto the processing queue
         Channel("chat-messages").send({
-            "room": channel_session['room'],
+            "room": message.channel_session['room'],
             "message": message['text'],
         })
 
@@ -603,6 +699,19 @@ have a ChatMessage model with ``message`` and ``room`` fields::
     @channel_session
     def ws_disconnect(message):
         Group("chat-%s" % message.channel_session['room']).discard(message.reply_channel)
+
+Update ``routing.py`` as well::
+
+    # in routing.py
+    from channels.routing import route
+    from myapp.consumers import ws_connect, ws_message, ws_disconnect, msg_consumer
+
+    channel_routing = [
+        route("websocket.connect", ws_connect),
+        route("websocket.receive", ws_message),
+        route("websocket.disconnect", ws_disconnect),
+        route("chat-messages", msg_consumer),
+    ]
 
 Note that we could add messages onto the ``chat-messages`` channel from anywhere;
 inside a View, inside another model's ``post_save`` signal, inside a management
@@ -621,77 +730,63 @@ sites with Channels - consumer ordering.
 
 Because Channels is a distributed system that can have many workers, by default
 it just processes messages in the order the workers get them off the queue.
-It's entirely feasible for a WebSocket interface server to send out a ``connect``
-and a ``receive`` message close enough together that a second worker will pick
-up and start processing the ``receive`` message before the first worker has
-finished processing the ``connect`` worker.
+It's entirely feasible for a WebSocket interface server to send out two
+``receive`` messages close enough together that a second worker will pick
+up and start processing the second message before the first worker has
+finished processing the first.
 
 This is particularly annoying if you're storing things in the session in the
-``connect`` consumer and trying to get them in the ``receive`` consumer - because
+one consumer and trying to get them in the other consumer - because
 the ``connect`` consumer hasn't exited, its session hasn't saved. You'd get the
 same effect if someone tried to request a view before the login view had finished
-processing, but there you're not expecting that page to run after the login,
-whereas you'd naturally expect ``receive`` to run after ``connect``.
+processing, of course, but HTTP requests usually come in a bit slower from clients.
 
 Channels has a solution - the ``enforce_ordering`` decorator. All WebSocket
 messages contain an ``order`` key, and this decorator uses that to make sure that
-messages are consumed in the right order, in one of two modes:
-
-* Slight ordering: Message 0 (``websocket.connect``) is done first, all others
-  are unordered
-
-* Strict ordering: All messages are consumed strictly in sequence
+messages are consumed in the right order. In addition, the ``connect`` message
+blocks the socket opening until it's responded to, so you are always guaranteed
+that ``connect`` will run before any ``receives`` even without the decorator.
 
 The decorator uses ``channel_session`` to keep track of what numbered messages
 have been processed, and if a worker tries to run a consumer on an out-of-order
 message, it raises the ``ConsumeLater`` exception, which puts the message
 back on the channel it came from and tells the worker to work on another message.
 
-There's a cost to using ``enforce_ordering``, which is why it's an optional
-decorator, and the cost is much greater in *strict* mode than it is in
-*slight* mode. Generally you'll want to use *slight* mode for most session-based WebSocket
-and other "continuous protocol" things. Here's an example, improving our
-first-letter-of-username chat from earlier::
+There's a high cost to using ``enforce_ordering``, which is why it's an optional
+decorator. Here's an example of it being used::
 
     # In consumers.py
     from channels import Channel, Group
     from channels.sessions import channel_session, enforce_ordering
-    from channels.auth import http_session_user, channel_session_user, channel_session_user_from_http
+    from channels.auth import channel_session_user, channel_session_user_from_http
 
     # Connected to websocket.connect
-    @enforce_ordering(slight=True)
     @channel_session_user_from_http
     def ws_add(message):
+        # This doesn't need a decorator - it always runs separately
+        message.channel_session['sent'] = 0
         # Add them to the right group
-        Group("chat-%s" % message.user.username[0]).add(message.reply_channel)
+        Group("chat").add(message.reply_channel)
+        # Accept the socket
+        message.reply_channel.send({"accept": True})
 
     # Connected to websocket.receive
-    @enforce_ordering(slight=True)
+    @enforce_ordering
     @channel_session_user
     def ws_message(message):
-        Group("chat-%s" % message.user.username[0]).send({
-            "text": message['text'],
+        # Without enforce_ordering this wouldn't work right
+        message.channel_session['sent'] = message.channel_session['sent'] + 1
+        Group("chat").send({
+            "text": "%s: %s" % (message.channel_session['sent'], message['text']),
         })
 
     # Connected to websocket.disconnect
-    @enforce_ordering(slight=True)
     @channel_session_user
     def ws_disconnect(message):
-        Group("chat-%s" % message.user.username[0]).discard(message.reply_channel)
-
-Slight ordering does mean that it's possible for a ``disconnect`` message to
-get processed before a ``receive`` message, but that's fine in this case;
-the client is disconnecting anyway, they don't care about those pending messages.
-
-Strict ordering is the default as it's the most safe; to use it, just call
-the decorator without arguments::
-
-    @enforce_ordering
-    def ws_message(message):
-        ...
+        Group("chat").discard(message.reply_channel)
 
 Generally, the performance (and safety) of your ordering is tied to your
-session backend's performance. Make sure you choose session backend wisely
+session backend's performance. Make sure you choose a session backend wisely
 if you're going to rely heavily on ``enforce_ordering``.
 
 

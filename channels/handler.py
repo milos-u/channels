@@ -12,13 +12,18 @@ from django import http
 from django.conf import settings
 from django.core import signals
 from django.core.handlers import base
-from django.core.urlresolvers import set_script_prefix
 from django.http import HttpResponseSendFile, HttpResponse, HttpResponseServerError
 from django.utils import datastructures
 from django.utils import six
 from django.utils.functional import cached_property
 
-from channels.exceptions import ResponseLater as ResponseLaterOuter, RequestTimeout, RequestAborted
+from channels.exceptions import RequestAborted, RequestTimeout, ResponseLater as ResponseLaterOuter
+
+try:
+    from django.urls import set_script_prefix
+except ImportError:
+    # Django < 1.10
+    from django.core.urlresolvers import set_script_prefix
 
 logger = logging.getLogger('django.request')
 
@@ -45,17 +50,22 @@ class AsgiRequest(http.HttpRequest):
         # Path info
         self.path = self.message['path']
         self.script_name = self.message.get('root_path', '')
-        if self.script_name:
+        if self.script_name and self.path.startswith(self.script_name):
             # TODO: Better is-prefix checking, slash handling?
             self.path_info = self.path[len(self.script_name):]
         else:
             self.path_info = self.path
         # HTTP basics
         self.method = self.message['method'].upper()
+        # fix https://github.com/django/channels/issues/622
+        query_string = self.message.get('query_string', '')
+        if isinstance(query_string, bytes):
+            query_string = query_string.decode('utf-8')
         self.META = {
             "REQUEST_METHOD": self.method,
-            "QUERY_STRING": self.message.get('query_string', ''),
+            "QUERY_STRING": query_string,
             "SCRIPT_NAME": self.script_name,
+            "PATH_INFO": self.path_info,
             # Old code will need these for a while
             "wsgi.multithread": True,
             "wsgi.multiprocess": True,
@@ -66,7 +76,10 @@ class AsgiRequest(http.HttpRequest):
             self.META['REMOTE_PORT'] = self.message['client'][1]
         if self.message.get('server', None):
             self.META['SERVER_NAME'] = self.message['server'][0]
-            self.META['SERVER_PORT'] = self.message['server'][1]
+            self.META['SERVER_PORT'] = six.text_type(self.message['server'][1])
+        else:
+            self.META['SERVER_NAME'] = "unknown"
+            self.META['SERVER_PORT'] = "0"
         # Handle old style-headers for a transition period
         if "headers" in self.message and isinstance(self.message['headers'], dict):
             self.message['headers'] = [
@@ -85,7 +98,7 @@ class AsgiRequest(http.HttpRequest):
             # HTTPbis say only ASCII chars are allowed in headers, but we latin1 just in case
             value = value.decode("latin1")
             if corrected_name in self.META:
-                value = self.META[corrected_name] + "," + value.decode("latin1")
+                value = self.META[corrected_name] + "," + value
             self.META[corrected_name] = value
         # Pull out request encoding if we find it
         if "CONTENT_TYPE" in self.META:
@@ -141,6 +154,9 @@ class AsgiRequest(http.HttpRequest):
     def GET(self):
         return http.QueryDict(self.message.get('query_string', ''))
 
+    def _get_scheme(self):
+        return self.message.get("scheme", "http")
+
     def _get_post(self):
         if not hasattr(self, '_post'):
             self._read_started = False
@@ -186,8 +202,8 @@ class AsgiHandler(base.BaseHandler):
         self.load_middleware()
 
     def __call__(self, message):
-        # Set script prefix from message root_path
-        set_script_prefix(message.get('root_path', ''))
+        # Set script prefix from message root_path, turning None into empty string
+        set_script_prefix(message.get('root_path', '') or '')
         signals.request_started.send(sender=self.__class__, message=message)
         # Run request through view system
         try:
@@ -203,7 +219,7 @@ class AsgiHandler(base.BaseHandler):
             response = http.HttpResponseBadRequest()
         except RequestTimeout:
             # Parsing the rquest failed, so the response is a Request Timeout error
-            response = HttpResponse("408 Request Timeout (upload too slow)", status_code=408)
+            response = HttpResponse("408 Request Timeout (upload too slow)", status=408)
         except RequestAborted:
             # Client closed connection on us mid request. Abort!
             return
@@ -347,7 +363,9 @@ class ViewConsumer(object):
                 # a whole worker if the client just vanishes and leaves the response
                 # channel full.
                 try:
-                    message.reply_channel.send(reply_message)
+                    # Note: Use immediately to prevent streaming responses trying
+                    # cache all data.
+                    message.reply_channel.send(reply_message, immediately=True)
                 except message.channel_layer.ChannelFull:
                     time.sleep(0.05)
                 else:

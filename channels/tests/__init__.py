@@ -1,2 +1,8 @@
-from .base import ChannelTestCase, Client, apply_routes  # NOQA isort:skip
-from .http import HttpClient  # NOQA isort:skip
+import warnings
+
+warnings.warn(
+    "channels.tests package is deprecated. Use channels.test",
+    DeprecationWarning,
+)
+
+from channels.test import *  # NOQA isort:skip

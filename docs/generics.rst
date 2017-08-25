@@ -63,7 +63,7 @@ If you want to perfom more complicated routing, you'll need to override the
 remember, though, your channel names cannot change during runtime and must
 always be the same for as long as your process runs.
 
-``BaseConsumer`` and all other generic consumers than inherit from it provide
+``BaseConsumer`` and all other generic consumers that inherit from it provide
 two instance variables on the class:
 
 * ``self.message``, the :ref:`Message object <ref-message>` representing the
@@ -88,9 +88,8 @@ The basic WebSocket generic consumer is used like this::
         # (you don't need channel_session_user, this implies it)
         http_user = True
 
-        # Set to True if you want them, else leave out
+        # Set to True if you want it, else leave it out
         strict_ordering = False
-        slight_ordering = False
 
         def connection_groups(self, **kwargs):
             """
@@ -103,7 +102,9 @@ The basic WebSocket generic consumer is used like this::
             """
             Perform things on connection start
             """
-            pass
+            # Accept the connection; this is done by default if you don't override
+            # the connect function.
+            self.message.reply_channel.send({"accept": True})
 
         def receive(self, text=None, bytes=None, **kwargs):
             """
@@ -133,9 +134,8 @@ The JSON-enabled consumer looks slightly different::
 
     class MyConsumer(JsonWebsocketConsumer):
 
-        # Set to True if you want them, else leave out
+        # Set to True if you want it, else leave it out
         strict_ordering = False
-        slight_ordering = False
 
         def connection_groups(self, **kwargs):
             """
@@ -163,6 +163,15 @@ The JSON-enabled consumer looks slightly different::
             """
             pass
 
+        # Optionally provide your own custom json encoder and decoder
+        # @classmethod
+        # def decode_json(cls, text):
+        #     return my_custom_json_decoder(text)
+        #
+        # @classmethod
+        # def encode_json(cls, content):
+        #     return my_custom_json_encoder(content)
+
 For this subclass, ``receive`` only gets a ``content`` argument that is the
 already-decoded JSON as Python datastructures; similarly, ``send`` now only
 takes a single argument, which it JSON-encodes before sending down to the
@@ -172,8 +181,8 @@ Note that this subclass still can't intercept ``Group.send()`` calls to make
 them into JSON automatically, but it does provide ``self.group_send(name, content)``
 that will do this for you if you call it explicitly.
 
-``self.close()`` is also provided to easily close the WebSocket from the server
-end once you are done with it.
+``self.close()`` is also provided to easily close the WebSocket from the
+server end with an optional status code once you are done with it.
 
 .. _multiplexing:
 
@@ -181,16 +190,7 @@ WebSocket Multiplexing
 ----------------------
 
 Channels provides a standard way to multiplex different data streams over
-a single WebSocket, called a ``Demultiplexer``. You use it like this::
-
-    from channels.generic.websockets import WebsocketDemultiplexer
-
-    class Demultiplexer(WebsocketDemultiplexer):
-
-        mapping = {
-            "intval": "binding.intval",
-            "stats": "internal.stats",
-        }
+a single WebSocket, called a ``Demultiplexer``.
 
 It expects JSON-formatted WebSocket frames with two keys, ``stream`` and
 ``payload``, and will match the ``stream`` against the mapping to find a
@@ -198,11 +198,44 @@ channel name. It will then forward the message onto that channel while
 preserving ``reply_channel``, so you can hook consumers up to them directly
 in the ``routing.py`` file, and use authentication decorators as you wish.
 
-You cannot use class-based consumers this way as the messages are no
-longer in WebSocket format, though. If you need to do operations on
-``connect`` or ``disconnect``, override those methods on the ``Demultiplexer``
-itself (you can also provide a ``connection_groups`` method, as it's just
-based on the JSON WebSocket generic consumer).
+
+Example using class-based consumer::
+
+    from channels.generic.websockets import WebsocketDemultiplexer, JsonWebsocketConsumer
+
+    class EchoConsumer(JsonWebsocketConsumer):
+        def connect(self, message, multiplexer, **kwargs):
+            # Send data with the multiplexer
+            multiplexer.send({"status": "I just connected!"})
+
+        def disconnect(self, message, multiplexer, **kwargs):
+            print("Stream %s is closed" % multiplexer.stream)
+
+        def receive(self, content, multiplexer, **kwargs):
+            # Simple echo
+            multiplexer.send({"original_message": content})
+
+
+    class AnotherConsumer(JsonWebsocketConsumer):
+        def receive(self, content, multiplexer=None, **kwargs):
+            # Some other actions here
+            pass
+
+
+    class Demultiplexer(WebsocketDemultiplexer):
+
+        # Wire your JSON consumers here: {stream_name : consumer}
+        consumers = {
+            "echo": EchoConsumer,
+            "other": AnotherConsumer,
+        }
+
+        # Optionally provide a custom multiplexer class
+        # multiplexer_class = MyCustomJsonEncodingMultiplexer
+
+
+The ``multiplexer`` allows the consumer class to be independent of the stream name.
+It holds the stream name and the demultiplexer on the attributes ``stream`` and ``demultiplexer``.
 
 The :doc:`data binding <binding>` code will also send out messages to clients
 in the same format, and you can encode things in this format yourself by
@@ -224,6 +257,16 @@ This will run the appropriate decorator around your handler methods, and provide
 the one passed in to your handler as an argument as well as ``self.message``,
 as they point to the same instance.
 
+And if you just want to use the user from the django session, add ``http_user``::
+
+    class MyConsumer(WebsocketConsumer):
+
+        http_user = True
+
+This will give you ``message.user``, which will be the same as ``request.user``
+would be on a regular View.
+
+
 Applying Decorators
 -------------------
 
@@ -240,3 +283,40 @@ want to override; like so::
 You can also use the Django ``method_decorator`` utility to wrap methods that
 have ``message`` as their first positional argument - note that it won't work
 for more high-level methods, like ``WebsocketConsumer.receive``.
+
+
+As route
+--------
+
+Instead of making routes using ``route_class`` you may use the ``as_route`` shortcut.
+This function takes route filters (:ref:`filters`) as kwargs and returns
+``route_class``. For example::
+
+    from . import consumers
+
+    channel_routing = [
+        consumers.ChatServer.as_route(path=r"^/chat/"),
+    ]
+
+Use the ``attrs`` dict keyword for dynamic class attributes. For example you have
+the generic consumer::
+
+    class MyGenericConsumer(WebsocketConsumer):
+        group = 'default'
+        group_prefix = ''
+
+        def connection_groups(self, **kwargs):
+            return ['_'.join(self.group_prefix, self.group)]
+
+You can create consumers with different ``group`` and  ``group_prefix`` with ``attrs``,
+like so::
+
+    from . import consumers
+
+    channel_routing = [
+        consumers.MyGenericConsumer.as_route(path=r"^/path/1/",
+                                             attrs={'group': 'one', 'group_prefix': 'pre'}),
+        consumers.MyGenericConsumer.as_route(path=r"^/path/2/",
+                                             attrs={'group': 'two', 'group_prefix': 'public'}),
+    ]
+

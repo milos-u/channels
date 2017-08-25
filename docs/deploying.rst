@@ -79,6 +79,19 @@ Make sure the same settings file is used across all your workers and interface
 servers; without it, they won't be able to talk to each other and things
 will just fail to work.
 
+If you prefer to use RabbitMQ layer, please refer to its
+`documentation <http://asgi-rabbitmq.readthedocs.io/en/latest/>`_.
+Usually your config will end up like this::
+
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "asgi_rabbitmq.RabbitmqChannelLayer",
+            "ROUTING": "my_project.routing.channel_routing",
+            "CONFIG": {
+                "url": "amqp://guest:guest@rabbitmq:5672/%2F",
+            },
+        },
+    }
 
 Run worker servers
 ------------------
@@ -123,6 +136,8 @@ Or telling a worker to ignore all messages on the "thumbnail" channel::
     python manage.py runworker --exclude-channels=thumbnail
 
 
+.. _run-interface-servers:
+
 Run interface servers
 ---------------------
 
@@ -134,8 +149,8 @@ If you want to support WebSockets, long-poll HTTP requests and other Channels
 features, you'll need to run a native ASGI interface server, as the WSGI
 specification has no support for running these kinds of requests concurrently.
 We ship with an interface server that we recommend you use called
-`Daphne <http://github.com/andrewgodwin/daphne/>`_; it supports WebSockets,
-long-poll HTTP requests, HTTP/2 *(soon)* and performs quite well.
+`Daphne <http://github.com/django/daphne/>`_; it supports WebSockets,
+long-poll HTTP requests, HTTP/2 and performs quite well.
 
 You can just keep running your Django code as a WSGI app if you like, behind
 something like uwsgi or gunicorn; this won't let you support WebSockets, though,
@@ -144,7 +159,7 @@ and configure routing in front of your interface and WSGI servers to route
 requests appropriately.
 
 If you use Daphne for all traffic, it auto-negotiates between HTTP and WebSocket,
-so there's no need to have your WebSockets on a separate port or path (and
+so there's no need to have your WebSockets on a separate domain or path (and
 they'll be able to share cookies with your normal view code, which isn't
 possible if you separate by domain rather than path).
 

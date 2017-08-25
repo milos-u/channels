@@ -4,10 +4,9 @@ import threading
 
 from optparse import make_option
 
-from daphne.server import Server
+from daphne.server import Server, build_endpoint_description_strings
 from django.conf import settings
-from django.core.management.commands.runserver import \
-    Command as RunserverCommand
+from django.core.management.commands.runserver import Command as RunserverCommand
 from django.utils import six
 from django.utils.encoding import DEFAULT_LOCALE_ENCODING
 
@@ -16,25 +15,36 @@ from channels.handler import ViewConsumer
 from channels.log import setup_logger
 from channels.staticfiles import StaticFilesConsumer
 from channels.worker import Worker
+from channels.utils import app_is_installed
 
 
 class Command(RunserverCommand):
+    protocol = 'http'
+    server_cls = Server
 
     option_list = RunserverCommand.option_list + (
         make_option('--noworker', action='store_false', dest='run_worker', default=True,
             help='Tells Django not to run a worker thread; you\'ll need to run one separately.'),
         make_option('--noasgi', action='store_false', dest='use_asgi', default=True,
-            help='Run the old WSGI-based runserver rather than the ASGI-based one')
+            help='Run the old WSGI-based runserver rather than the ASGI-based one'),
+        make_option('--http_timeout', action='store', dest='http_timeout', type=int, default=60,
+            help='Specify the daphne http_timeout interval in seconds (default: 60)'),
+        make_option('--websocket_handshake_timeout', action='store', dest='websocket_handshake_timeout',
+            type=int, default=5,
+            help='Specify the daphne websocket_handshake_timeout interval in seconds (default: 5)')
     )
 
     def handle(self, *args, **options):
         self.verbosity = options.get("verbosity", 1)
         self.logger = setup_logger('django.channels', self.verbosity)
+        self.http_timeout = options.get("http_timeout", 60)
+        self.websocket_handshake_timeout = options.get("websocket_handshake_timeout", 5)
         super(Command, self).handle(*args, **options)
 
     def inner_run(self, *args, **options):
         # Maybe they want the wsgi one?
         if not options.get("use_asgi", True) or DEFAULT_CHANNEL_LAYER not in channel_layers:
+            self.server_cls = RunserverCommand.server_cls
             return RunserverCommand.inner_run(self, *args, **options)
         # Check a handler is registered for http reqs; if not, add default one
         self.channel_layer = channel_layers[DEFAULT_CHANNEL_LAYER]
@@ -53,12 +63,13 @@ class Command(RunserverCommand):
         self.stdout.write(now)
         self.stdout.write((
             "Django version %(version)s, using settings %(settings)r\n"
-            "Starting Channels development server at http://%(addr)s:%(port)s/\n"
+            "Starting Channels development server at %(protocol)s://%(addr)s:%(port)s/\n"
             "Channel layer %(layer)s\n"
             "Quit the server with %(quit_command)s.\n"
         ) % {
             "version": self.get_version(),
             "settings": settings.SETTINGS_MODULE,
+            "protocol": self.protocol,
             "addr": '[%s]' % self.addr if self._raw_ipv6 else self.addr,
             "port": self.port,
             "quit_command": quit_command,
@@ -75,15 +86,19 @@ class Command(RunserverCommand):
         # Launch server in 'main' thread. Signals are disabled as it's still
         # actually a subthread under the autoreloader.
         self.logger.debug("Daphne running, listening on %s:%s", self.addr, self.port)
+
+        # build the endpoint description string from host/port options
+        endpoints = build_endpoint_description_strings(host=self.addr, port=self.port)
         try:
-            Server(
+            self.server_cls(
                 channel_layer=self.channel_layer,
-                host=self.addr,
-                port=int(self.port),
+                endpoints=endpoints,
                 signal_handlers=not options['use_reloader'],
                 action_logger=self.log_action,
-                http_timeout=60,  # Shorter timeout than normal as it's dev
+                http_timeout=self.http_timeout,
                 ws_protocols=getattr(settings, 'CHANNELS_WS_PROTOCOLS', None),
+                root_path=getattr(settings, 'FORCE_SCRIPT_NAME', '') or '',
+                websocket_handshake_timeout=self.websocket_handshake_timeout,
             ).run()
             self.logger.debug("Daphne exited")
         except KeyboardInterrupt:
@@ -123,6 +138,10 @@ class Command(RunserverCommand):
             msg += "WebSocket CONNECT %(path)s [%(client)s]\n" % details
         elif protocol == "websocket" and action == "disconnected":
             msg += "WebSocket DISCONNECT %(path)s [%(client)s]\n" % details
+        elif protocol == "websocket" and action == "connecting":
+            msg += "WebSocket HANDSHAKING %(path)s [%(client)s]\n" % details
+        elif protocol == "websocket" and action == "rejected":
+            msg += "WebSocket REJECT %(path)s [%(client)s]\n" % details
 
         sys.stderr.write(msg)
 
@@ -132,7 +151,8 @@ class Command(RunserverCommand):
         if static files should be served. Otherwise just returns the default
         handler.
         """
-        use_static_handler = options.get('use_static_handler', True)
+        staticfiles_installed = app_is_installed("django.contrib.staticfiles")
+        use_static_handler = options.get('use_static_handler', staticfiles_installed)
         insecure_serving = options.get('insecure_serving', False)
         if use_static_handler and (settings.DEBUG or insecure_serving):
             return StaticFilesConsumer()
@@ -153,5 +173,6 @@ class WorkerThread(threading.Thread):
     def run(self):
         self.logger.debug("Worker thread running")
         worker = Worker(channel_layer=self.channel_layer, signal_handlers=False)
+        worker.ready()
         worker.run()
         self.logger.debug("Worker thread exited")

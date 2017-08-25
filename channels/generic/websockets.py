@@ -1,7 +1,8 @@
-from django.core.serializers.json import json, DjangoJSONEncoder
+from django.core.serializers.json import DjangoJSONEncoder, json
 
-from ..channel import Group, Channel
-from ..auth import channel_session_user_from_http
+from ..auth import channel_and_http_session_user_from_http, channel_session_user_from_http
+from ..channel import Group
+from ..exceptions import SendNotAvailableOnDemultiplexer
 from ..sessions import enforce_ordering
 from .base import BaseConsumer
 
@@ -22,10 +23,12 @@ class WebsocketConsumer(BaseConsumer):
     # Turning this on passes the user over from the HTTP session on connect,
     # implies channel_session_user
     http_user = False
+    http_user_and_session = False
 
-    # Set one to True if you want the class to enforce ordering for you
-    slight_ordering = False
+    # Set to True if you want the class to enforce ordering for you
     strict_ordering = False
+
+    groups = None
 
     def get_handler(self, message, **kwargs):
         """
@@ -33,19 +36,21 @@ class WebsocketConsumer(BaseConsumer):
         adds the ordering decorator.
         """
         # HTTP user implies channel session user
-        if self.http_user:
+        if self.http_user or self.http_user_and_session:
             self.channel_session_user = True
         # Get super-handler
         self.path = message['path']
         handler = super(WebsocketConsumer, self).get_handler(message, **kwargs)
         # Optionally apply HTTP transfer
-        if self.http_user:
+        if self.http_user_and_session:
+            handler = channel_and_http_session_user_from_http(handler)
+        elif self.http_user:
             handler = channel_session_user_from_http(handler)
         # Ordering decorators
         if self.strict_ordering:
             return enforce_ordering(handler, slight=False)
-        elif self.slight_ordering:
-            return enforce_ordering(handler, slight=True)
+        elif getattr(self, "slight_ordering", False):
+            raise ValueError("Slight ordering is now always on. Please remove `slight_ordering=True`.")
         else:
             return handler
 
@@ -54,7 +59,7 @@ class WebsocketConsumer(BaseConsumer):
         Group(s) to make people join when they connect and leave when they
         disconnect. Make sure to return a list/tuple, not a string!
         """
-        return []
+        return self.groups or []
 
     def raw_connect(self, message, **kwargs):
         """
@@ -69,7 +74,7 @@ class WebsocketConsumer(BaseConsumer):
         """
         Called when a WebSocket connection is opened.
         """
-        pass
+        self.message.reply_channel.send({"accept": True})
 
     def raw_receive(self, message, **kwargs):
         """
@@ -93,7 +98,7 @@ class WebsocketConsumer(BaseConsumer):
         """
         message = {}
         if close:
-            message["close"] = True
+            message["close"] = close
         if text is not None:
             message["text"] = text
         elif bytes is not None:
@@ -106,7 +111,7 @@ class WebsocketConsumer(BaseConsumer):
     def group_send(cls, name, text=None, bytes=None, close=False):
         message = {}
         if close:
-            message["close"] = True
+            message["close"] = close
         if text is not None:
             message["text"] = text
         elif bytes is not None:
@@ -115,11 +120,11 @@ class WebsocketConsumer(BaseConsumer):
             raise ValueError("You must pass text or bytes")
         Group(name).send(message)
 
-    def close(self):
+    def close(self, status=True):
         """
         Closes the WebSocket from the server end
         """
-        self.message.reply_channel.send({"close": True})
+        self.message.reply_channel.send({"close": status})
 
     def raw_disconnect(self, message, **kwargs):
         """
@@ -132,7 +137,7 @@ class WebsocketConsumer(BaseConsumer):
 
     def disconnect(self, message, **kwargs):
         """
-        Called when a WebSocket connection is opened.
+        Called when a WebSocket connection is closed.
         """
         pass
 
@@ -146,7 +151,7 @@ class JsonWebsocketConsumer(WebsocketConsumer):
 
     def raw_receive(self, message, **kwargs):
         if "text" in message:
-            self.receive(json.loads(message['text']), **kwargs)
+            self.receive(self.decode_json(message['text']), **kwargs)
         else:
             raise ValueError("No text section for incoming WebSocket frame!")
 
@@ -160,11 +165,58 @@ class JsonWebsocketConsumer(WebsocketConsumer):
         """
         Encode the given content as JSON and send it to the client.
         """
-        super(JsonWebsocketConsumer, self).send(text=json.dumps(content), close=close)
+        super(JsonWebsocketConsumer, self).send(text=self.encode_json(content), close=close)
+
+    @classmethod
+    def decode_json(cls, text):
+        return json.loads(text)
+
+    @classmethod
+    def encode_json(cls, content):
+        return json.dumps(content)
 
     @classmethod
     def group_send(cls, name, content, close=False):
-        WebsocketConsumer.group_send(name, json.dumps(content), close=close)
+        WebsocketConsumer.group_send(name, cls.encode_json(content), close=close)
+
+
+class WebsocketMultiplexer(object):
+    """
+    The opposite of the demultiplexer, to send a message though a multiplexed channel.
+
+    The multiplexer object is passed as a kwargs to the consumer when the message is dispatched.
+    This pattern allows the consumer class to be independent of the stream name.
+    """
+
+    stream = None
+    reply_channel = None
+
+    def __init__(self, stream, reply_channel):
+        self.stream = stream
+        self.reply_channel = reply_channel
+
+    def send(self, payload):
+        """Multiplex the payload using the stream name and send it."""
+        self.reply_channel.send(self.encode(self.stream, payload))
+
+    @classmethod
+    def encode_json(cls, content):
+        return json.dumps(content, cls=DjangoJSONEncoder)
+
+    @classmethod
+    def encode(cls, stream, payload):
+        """
+        Encodes stream + payload for outbound sending.
+        """
+        content = {"stream": stream, "payload": payload}
+        return {"text": cls.encode_json(content)}
+
+    @classmethod
+    def group_send(cls, name, stream, payload, close=False):
+        message = cls.encode(stream, payload)
+        if close:
+            message["close"] = True
+        Group(name).send(message)
 
 
 class WebsocketDemultiplexer(JsonWebsocketConsumer):
@@ -174,52 +226,66 @@ class WebsocketDemultiplexer(JsonWebsocketConsumer):
     in a sub-dict called "payload". This lets you run multiple streams over
     a single WebSocket connection in a standardised way.
 
-    Incoming messages on streams are mapped into a custom channel so you can
+    Incoming messages on streams are dispatched to consumers so you can
     just tie in consumers the normal way. The reply_channels are kept so
     sessions/auth continue to work. Payloads must be a dict at the top level,
     so they fulfill the Channels message spec.
 
-    Set a mapping from streams to channels in the "mapping" key. We make you
-    whitelist channels like this to allow different namespaces and for security
-    reasons (imagine if someone could inject straight into websocket.receive).
+    To answer with a multiplexed message, a multiplexer object
+    with "send" and "group_send" methods is forwarded to the consumer as a kwargs
+    "multiplexer".
+
+    Set a mapping of streams to consumer classes in the "consumers" keyword.
     """
 
-    mapping = {}
+    # Put your JSON consumers here: {stream_name : consumer}
+    consumers = {}
+
+    # Optionally use a custom multiplexer class
+    multiplexer_class = WebsocketMultiplexer
 
     def receive(self, content, **kwargs):
+        """Forward messages to all consumers."""
         # Check the frame looks good
         if isinstance(content, dict) and "stream" in content and "payload" in content:
             # Match it to a channel
-            stream = content['stream']
-            if stream in self.mapping:
-                # Extract payload and add in reply_channel
-                payload = content['payload']
-                if not isinstance(payload, dict):
-                    raise ValueError("Multiplexed frame payload is not a dict")
-                payload['reply_channel'] = self.message['reply_channel']
-                # Send it onto the new channel
-                Channel(self.mapping[stream]).send(payload)
-            else:
-                raise ValueError("Invalid multiplexed frame received (stream not mapped)")
-        else:
-            raise ValueError("Invalid multiplexed frame received (no channel/payload key)")
+            for stream, consumer in self.consumers.items():
+                if stream == content['stream']:
+                    # Extract payload and add in reply_channel
+                    payload = content['payload']
+                    if not isinstance(payload, dict):
+                        raise ValueError("Multiplexed frame payload is not a dict")
+                    # The json consumer expects serialized JSON
+                    self.message.content['text'] = self.encode_json(payload)
+                    # Send demultiplexer to the consumer, to be able to answer
+                    kwargs['multiplexer'] = self.multiplexer_class(stream, self.message.reply_channel)
+                    # Patch send to avoid sending not formatted messages from the consumer
+                    if hasattr(consumer, "send"):
+                        consumer.send = self.send
+                    # Dispatch message
+                    consumer(self.message, **kwargs)
+                    return
 
-    def send(self, stream, payload):
-        self.message.reply_channel.send(self.encode(stream, payload))
+            raise ValueError("Invalid multiplexed frame received (stream not mapped)")
+        else:
+            raise ValueError("Invalid multiplexed **frame received (no channel/payload key)")
+
+    def connect(self, message, **kwargs):
+        """Forward connection to all consumers."""
+        self.message.reply_channel.send({"accept": True})
+        for stream, consumer in self.consumers.items():
+            kwargs['multiplexer'] = self.multiplexer_class(stream, self.message.reply_channel)
+            consumer(message, **kwargs)
+
+    def disconnect(self, message, **kwargs):
+        """Forward disconnection to all consumers."""
+        for stream, consumer in self.consumers.items():
+            kwargs['multiplexer'] = self.multiplexer_class(stream, self.message.reply_channel)
+            consumer(message, **kwargs)
+
+    def send(self, *args):
+        raise SendNotAvailableOnDemultiplexer("Use multiplexer.send of the multiplexer kwarg.")
 
     @classmethod
     def group_send(cls, name, stream, payload, close=False):
-        message = cls.encode(stream, payload)
-        if close:
-            message["close"] = True
-        Group(name).send(message)
-
-    @classmethod
-    def encode(cls, stream, payload):
-        """
-        Encodes stream + payload for outbound sending.
-        """
-        return {"text": json.dumps({
-            "stream": stream,
-            "payload": payload,
-        }, cls=DjangoJSONEncoder)}
+        raise SendNotAvailableOnDemultiplexer("Use WebsocketMultiplexer.group_send")

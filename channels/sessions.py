@@ -8,6 +8,7 @@ from django.contrib.sessions.backends.base import CreateError
 
 from .exceptions import ConsumeLater
 from .handler import AsgiRequest
+from .message import Message
 
 
 def session_for_reply_channel(reply_channel):
@@ -17,7 +18,7 @@ def session_for_reply_channel(reply_channel):
     """
     # We hash the whole reply channel name and add a prefix, to fit inside 32B
     reply_name = reply_channel
-    hashed = hashlib.md5(reply_name.encode("utf8")).hexdigest()
+    hashed = hashlib.sha1(reply_name.encode("utf8")).hexdigest()
     session_key = "chn" + hashed[:29]
     # Make a session storage
     session_engine = import_module(getattr(settings, "CHANNEL_SESSION_ENGINE", settings.SESSION_ENGINE))
@@ -39,10 +40,23 @@ def channel_session(func):
     Use this to persist data across the lifetime of a connection.
     """
     @functools.wraps(func)
-    def inner(message, *args, **kwargs):
+    def inner(*args, **kwargs):
+        message = None
+        for arg in args[:2]:
+            if isinstance(arg, Message):
+                message = arg
+                break
+        if message is None:
+            raise ValueError('channel_session called without Message instance')
         # Make sure there's NOT a channel_session already
         if hasattr(message, "channel_session"):
-            return func(message, *args, **kwargs)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                # Persist session if needed
+                if message.channel_session.modified:
+                    message.channel_session.save()
+
         # Make sure there's a reply_channel
         if not message.reply_channel:
             raise ValueError(
@@ -61,25 +75,54 @@ def channel_session(func):
         message.channel_session = session
         # Run the consumer
         try:
-            return func(message, *args, **kwargs)
+            return func(*args, **kwargs)
         finally:
             # Persist session if needed
-            if session.modified:
+            if session.modified and not session.is_empty():
                 session.save()
     return inner
 
 
+def wait_channel_name(reply_channel):
+    """
+    Given a reply_channel, returns a wait channel for it.
+    Replaces any ! with ? so process-specific channels become single-reader
+    channels.
+    """
+    return "__wait__.%s" % (reply_channel.replace("!", "?"), )
+
+
+def requeue_messages(message):
+    """
+    Requeue any pending wait channel messages for this socket connection back onto it's original channel
+    """
+    while True:
+        wait_channel = wait_channel_name(message.reply_channel.name)
+        channel, content = message.channel_layer.receive_many([wait_channel], block=False)
+        if channel:
+            original_channel = content.pop("original_channel")
+            try:
+                message.channel_layer.send(original_channel, content)
+            except message.channel_layer.ChannelFull:
+                raise message.channel_layer.ChannelFull(
+                    "Cannot requeue pending __wait__ channel message " +
+                    "back on to already full channel %s" % original_channel
+                )
+        else:
+            break
+
+
 def enforce_ordering(func=None, slight=False):
     """
-    Enforces either slight (order=0 comes first, everything else isn't ordered)
-    or strict (all messages exactly ordered) ordering against a reply_channel.
+    Enforces strict (all messages exactly ordered) ordering against a reply_channel.
 
     Uses sessions to track ordering and socket-specific wait channels for unordered messages.
-
-    You cannot mix slight ordering and strict ordering on a channel; slight
-    ordering does not write to the session after the first message to improve
-    performance.
     """
+    # Slight is deprecated
+    if slight:
+        raise ValueError("Slight ordering is now always on due to Channels changes. Please remove the decorator.")
+
+    # Main decorator
     def decorator(func):
         @channel_session
         @functools.wraps(func)
@@ -93,31 +136,17 @@ def enforce_ordering(func=None, slight=False):
             order = int(message.content['order'])
             # See what the current next order should be
             next_order = message.channel_session.get("__channels_next_order", 0)
-            if order == next_order or (slight and next_order > 0):
+            if order == next_order:
                 # Run consumer
                 func(message, *args, **kwargs)
                 # Mark next message order as available for running
-                if order == 0 or not slight:
-                    message.channel_session["__channels_next_order"] = order + 1
-                    message.channel_session.save()
-                # Requeue any pending wait channel messages for this socket connection back onto it's original channel
-                while True:
-                    wait_channel = "__wait__.%s" % message.reply_channel.name
-                    channel, content = message.channel_layer.receive_many([wait_channel], block=False)
-                    if channel:
-                        original_channel = content.pop("original_channel")
-                        try:
-                            message.channel_layer.send(original_channel, content)
-                        except message.channel_layer.ChannelFull:
-                            raise message.channel_layer.ChannelFull(
-                                "Cannot requeue pending __wait__ channel message " +
-                                "back on to already full channel %s" % original_channel
-                            )
-                    else:
-                        break
+                message.channel_session["__channels_next_order"] = order + 1
+                message.channel_session.save()
+                message.channel_session.modified = False
+                requeue_messages(message)
             else:
                 # Since out of order, enqueue message temporarily to wait channel for this socket connection
-                wait_channel = "__wait__.%s" % message.reply_channel.name
+                wait_channel = wait_channel_name(message.reply_channel.name)
                 message.content["original_channel"] = message.channel.name
                 try:
                     message.channel_layer.send(wait_channel, message.content)
@@ -126,6 +155,11 @@ def enforce_ordering(func=None, slight=False):
                         "Cannot add unordered message to already " +
                         "full __wait__ channel for socket %s" % message.reply_channel.name
                     )
+                # Next order may have changed while this message was being processed
+                # Requeue messages if this has happened
+                if order == message.channel_session.load().get("__channels_next_order", 0):
+                    requeue_messages(message)
+
         return inner
     if func is not None:
         return decorator(func)
@@ -155,7 +189,13 @@ def http_session(func):
     def inner(message, *args, **kwargs):
         # Make sure there's NOT a http_session already
         if hasattr(message, "http_session"):
-            return func(message, *args, **kwargs)
+            try:
+                return func(message, *args, **kwargs)
+            finally:
+                # Persist session if needed (won't be saved if error happens)
+                if message.http_session is not None and message.http_session.modified:
+                    message.http_session.save()
+
         try:
             # We want to parse the WebSocket (or similar HTTP-lite) message
             # to get cookies and GET, but we need to add in a few things that
@@ -182,4 +222,28 @@ def http_session(func):
         if session is not None and session.modified:
             session.save()
         return result
+    return inner
+
+
+def channel_and_http_session(func):
+    """
+    Enables both the channel_session and http_session.
+
+    Stores the http session key in the channel_session on websocket.connect messages.
+    It will then hydrate the http_session from that same key on subsequent messages.
+    """
+    @http_session
+    @channel_session
+    @functools.wraps(func)
+    def inner(message, *args, **kwargs):
+        # Store the session key in channel_session
+        if message.http_session is not None and settings.SESSION_COOKIE_NAME not in message.channel_session:
+            message.channel_session[settings.SESSION_COOKIE_NAME] = message.http_session.session_key
+        # Hydrate the http_session from session_key
+        elif message.http_session is None and settings.SESSION_COOKIE_NAME in message.channel_session:
+            session_engine = import_module(settings.SESSION_ENGINE)
+            session = session_engine.SessionStore(session_key=message.channel_session[settings.SESSION_COOKIE_NAME])
+            message.http_session = session
+        # Run the consumer
+        return func(message, *args, **kwargs)
     return inner

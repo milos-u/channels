@@ -3,9 +3,9 @@ import json
 from django.core import serializers
 from django.core.serializers.json import DjangoJSONEncoder
 
-from .base import Binding
-from ..generic.websockets import WebsocketDemultiplexer
+from ..generic.websockets import WebsocketMultiplexer
 from ..sessions import enforce_ordering
+from .base import Binding
 
 
 class WebsocketBinding(Binding):
@@ -26,11 +26,9 @@ class WebsocketBinding(Binding):
     """
 
     # Mark as abstract
-
     model = None
 
     # Stream multiplexing name
-
     stream = None
 
     # Decorators
@@ -40,7 +38,7 @@ class WebsocketBinding(Binding):
     # Outbound
     @classmethod
     def encode(cls, stream, payload):
-        return WebsocketDemultiplexer.encode(stream, payload)
+        return WebsocketMultiplexer.encode(stream, payload)
 
     def serialize(self, instance, action):
         payload = {
@@ -55,10 +53,13 @@ class WebsocketBinding(Binding):
         """
         Serializes model data into JSON-compatible types.
         """
-        if self.fields == ['__all__']:
-            fields = None
+        if self.fields is not None:
+            if self.fields == '__all__' or list(self.fields) == ['__all__']:
+                fields = None
+            else:
+                fields = self.fields
         else:
-            fields = self.fields
+            fields = [f.name for f in instance._meta.get_fields() if f.name not in self.exclude]
         data = serializers.serialize('json', [instance], fields=fields)
         return json.loads(data)[0]['fields']
 
@@ -78,14 +79,25 @@ class WebsocketBinding(Binding):
         else:
             return handler
 
+    @classmethod
+    def trigger_inbound(cls, message, **kwargs):
+        """
+        Overrides base trigger_inbound to ignore connect/disconnect.
+        """
+        # Only allow received packets through further.
+        if message.channel.name != "websocket.receive":
+            return
+        super(WebsocketBinding, cls).trigger_inbound(message, **kwargs)
+
     def deserialize(self, message):
         """
         You must hook this up behind a Deserializer, so we expect the JSON
         already dealt with.
         """
-        action = message['action']
-        pk = message.get('pk', None)
-        data = message.get('data', None)
+        body = json.loads(message['text'])
+        action = body['action']
+        pk = body.get('pk', None)
+        data = body.get('data', None)
         return action, pk, data
 
     def _hydrate(self, pk, data):
@@ -100,8 +112,7 @@ class WebsocketBinding(Binding):
                 "fields": data,
             }
         ]
-        # TODO: Avoid the JSON roundtrip by using encoder directly?
-        return list(serializers.deserialize("json", json.dumps(s_data)))[0]
+        return list(serializers.deserialize("python", s_data))[0]
 
     def create(self, data):
         self._hydrate(None, data).save()
@@ -109,8 +120,15 @@ class WebsocketBinding(Binding):
     def update(self, pk, data):
         instance = self.model.objects.get(pk=pk)
         hydrated = self._hydrate(pk, data)
-        for name in data.keys():
-            setattr(instance, name, getattr(hydrated.object, name))
+
+        if self.fields is not None:
+            for name in data.keys():
+                if name in self.fields or self.fields == ['__all__']:
+                    setattr(instance, name, getattr(hydrated.object, name))
+        else:
+            for name in data.keys():
+                if name not in self.exclude:
+                    setattr(instance, name, getattr(hydrated.object, name))
         instance.save()
 
 
@@ -145,8 +163,8 @@ class WebsocketBindingWithMembers(WebsocketBinding):
 
     encoder = DjangoJSONEncoder()
 
-    def serialize_data(self, instance):
-        data = super(WebsocketBindingWithMembers, self).serialize_data(instance)
+    def serialize_data(self, instance, **kwargs):
+        data = super(WebsocketBindingWithMembers, self).serialize_data(instance, **kwargs)
         member_data = {}
         for m in self.send_members:
             member = instance
