@@ -4,11 +4,11 @@ import json
 import six
 #from django.apps import apps
 from django.conf import settings
-from django.http.cookie import SimpleCookie
+from django.http import SimpleCookie
 
 from ..sessions import session_for_reply_channel
 from .base import Client
-from .utils import app_is_installed
+from ..utils import app_is_installed
 
 json_module = json  # alias for using at functions with json kwarg
 
