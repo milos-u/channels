@@ -31,7 +31,7 @@ class Command(BaseCommand):
             help='Prevents this worker from listening on the provided channels (supports globbing).',
         ),
         make_option(
-            '--threads', action='store', dest='threads', default=1,
+            '--threads', action='store', dest='threads', type=int, default=1,
             help='Number of worker threads to start. Default: 1.',
         ),
     )
