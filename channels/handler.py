@@ -312,6 +312,11 @@ class AsgiHandler(base.BaseHandler):
                     message['more_content'] = True
                     yield message
                     message = {}
+            # prevent 
+            # AttributeError: 'HttpResponseSendFile' object has no attribute
+            #   '_container'
+            # when calling response.close() later
+            response._container = []
             # Final closing message
             message["more_content"] = False
             yield message
