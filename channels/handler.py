@@ -207,32 +207,36 @@ class AsgiHandler(base.BaseHandler):
         signals.request_started.send(sender=self.__class__, message=message)
         # Run request through view system
         try:
-            request = self.request_class(message)
-        except UnicodeDecodeError:
-            logger.warning(
-                'Bad Request (UnicodeDecodeError)',
-                exc_info=sys.exc_info(),
-                extra={
-                    'status_code': 400,
-                }
-            )
-            response = http.HttpResponseBadRequest()
-        except RequestTimeout:
-            # Parsing the rquest failed, so the response is a Request Timeout error
-            response = HttpResponse("408 Request Timeout (upload too slow)", status=408)
-        except RequestAborted:
-            # Client closed connection on us mid request. Abort!
-            return
-        else:
             try:
-                response = self.get_response(request)
-                # Fix chunk size on file responses
-                if isinstance(response, HttpResponseSendFile):
-                    response.block_size = 1024 * 512
-            except AsgiRequest.ResponseLater:
-                # The view has promised something else
-                # will send a response at a later time
+                request = self.request_class(message)
+            except UnicodeDecodeError:
+                logger.warning(
+                    'Bad Request (UnicodeDecodeError)',
+                    exc_info=sys.exc_info(),
+                    extra={
+                        'status_code': 400,
+                    }
+                )
+                response = http.HttpResponseBadRequest()
+            except RequestTimeout:
+                # Parsing the rquest failed, so the response is a Request Timeout error
+                response = HttpResponse("408 Request Timeout (upload too slow)", status=408)
+            except RequestAborted:
+                # Client closed connection on us mid request. Abort!
                 return
+            else:
+                try:
+                    response = self.get_response(request)
+                    # Fix chunk size on file responses
+                    if isinstance(response, HttpResponseSendFile):
+                        response.block_size = 1024 * 512
+                except AsgiRequest.ResponseLater:
+                    # The view has promised something else
+                    # will send a response at a later time
+                    return
+        finally:
+            signals.request_finished.send(sender=self.__class__)
+
         # Transform response into messages, which we yield back to caller
         for message in self.encode_response(response):
             # TODO: file_to_stream
