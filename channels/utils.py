@@ -1,9 +1,6 @@
 import types
 
 
-from django.conf import settings
-
-
 def name_that_thing(thing):
     """
     Returns either the function/class path or just the object's repr
@@ -27,6 +24,3 @@ def name_that_thing(thing):
     if hasattr(thing, "__class__"):
         return name_that_thing(thing.__class__)
     return repr(thing)
-
-def app_is_installed(name):
-    return name in settings.INSTALLED_APPS

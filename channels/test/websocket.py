@@ -2,15 +2,15 @@ import copy
 import json
 
 import six
-#from django.apps import apps
+from django.apps import apps
 from django.conf import settings
-from django.http import SimpleCookie
+from django.http.cookie import SimpleCookie
 
 from ..sessions import session_for_reply_channel
 from .base import Client
-from ..utils import app_is_installed
 
 json_module = json  # alias for using at functions with json kwarg
+
 
 class WSClient(Client):
     """
@@ -44,7 +44,7 @@ class WSClient(Client):
     def get_cookies(self):
         """Return cookies"""
         cookies = copy.copy(self._cookies)
-        if self._session_cookie and app_is_installed('django.contrib.sessions'):
+        if self._session_cookie and apps.is_installed('django.contrib.sessions'):
             cookies[settings.SESSION_COOKIE_NAME] = self.session.session_key
         return cookies
 
@@ -57,7 +57,7 @@ class WSClient(Client):
     @property
     def session(self):
         """Session as Lazy property: check that django.contrib.sessions is installed"""
-        if not app_is_installed('django.contrib.sessions'):
+        if not apps.is_installed('django.contrib.sessions'):
             raise EnvironmentError('Add django.contrib.sessions to the INSTALLED_APPS to use session')
         if not self._session:
             self._session = session_for_reply_channel(self.reply_channel)
@@ -133,7 +133,7 @@ class WSClient(Client):
         """
         from django.contrib.auth import authenticate
         user = authenticate(**credentials)
-        if user and user.is_active and app_is_installed('django.contrib.sessions'):
+        if user and user.is_active and apps.is_installed('django.contrib.sessions'):
             self._login(user)
             return True
         else:

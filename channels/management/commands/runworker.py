@@ -1,7 +1,6 @@
 from __future__ import unicode_literals
 
-from optparse import make_option
-
+from django.apps import apps
 from django.conf import settings
 from django.core.management import BaseCommand, CommandError
 
@@ -10,31 +9,31 @@ from channels.log import setup_logger
 from channels.signals import worker_process_ready
 from channels.staticfiles import StaticFilesConsumer
 from channels.worker import Worker, WorkerGroup
-from channels.utils import app_is_installed
 
 
 class Command(BaseCommand):
 
     leave_locale_alone = True
 
-    option_list = BaseCommand.option_list + (
-        make_option(
+    def add_arguments(self, parser):
+        super(Command, self).add_arguments(parser)
+        parser.add_argument(
             '--layer', action='store', dest='layer', default=DEFAULT_CHANNEL_LAYER,
             help='Channel layer alias to use, if not the default.',
-        ),
-        make_option(
+        )
+        parser.add_argument(
             '--only-channels', action='append', dest='only_channels',
             help='Limits this worker to only listening on the provided channels (supports globbing).',
-        ),
-        make_option(
+        )
+        parser.add_argument(
             '--exclude-channels', action='append', dest='exclude_channels',
             help='Prevents this worker from listening on the provided channels (supports globbing).',
-        ),
-        make_option(
-            '--threads', action='store', dest='threads', type=int, default=1,
-            help='Number of worker threads to start. Default: 1.',
-        ),
-    )
+        )
+        parser.add_argument(
+            '--threads', action='store', dest='threads',
+            default=1, type=int,
+            help='Number of threads to execute.'
+        )
 
     def handle(self, *args, **options):
         # Get the backend to use
@@ -50,7 +49,7 @@ class Command(BaseCommand):
             )
         # Check a handler is registered for http reqs
         # Serve static files if Django in debug mode
-        if settings.DEBUG and app_is_installed('django.contrib.staticfiles'):
+        if settings.DEBUG and apps.is_installed('django.contrib.staticfiles'):
             self.channel_layer.router.check_default(http_consumer=StaticFilesConsumer())
         else:
             self.channel_layer.router.check_default()

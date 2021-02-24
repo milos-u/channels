@@ -2,37 +2,35 @@ import datetime
 import sys
 import threading
 
-from optparse import make_option
-
 from daphne.server import Server, build_endpoint_description_strings
+from django.apps import apps
 from django.conf import settings
 from django.core.management.commands.runserver import Command as RunserverCommand
 from django.utils import six
-from django.utils.encoding import DEFAULT_LOCALE_ENCODING
+from django.utils.encoding import get_system_encoding
 
 from channels import DEFAULT_CHANNEL_LAYER, channel_layers
 from channels.handler import ViewConsumer
 from channels.log import setup_logger
 from channels.staticfiles import StaticFilesConsumer
 from channels.worker import Worker
-from channels.utils import app_is_installed
 
 
 class Command(RunserverCommand):
     protocol = 'http'
     server_cls = Server
 
-    option_list = RunserverCommand.option_list + (
-        make_option('--noworker', action='store_false', dest='run_worker', default=True,
-            help='Tells Django not to run a worker thread; you\'ll need to run one separately.'),
-        make_option('--noasgi', action='store_false', dest='use_asgi', default=True,
-            help='Run the old WSGI-based runserver rather than the ASGI-based one'),
-        make_option('--http_timeout', action='store', dest='http_timeout', type=int, default=60,
-            help='Specify the daphne http_timeout interval in seconds (default: 60)'),
-        make_option('--websocket_handshake_timeout', action='store', dest='websocket_handshake_timeout',
+    def add_arguments(self, parser):
+        super(Command, self).add_arguments(parser)
+        parser.add_argument('--noworker', action='store_false', dest='run_worker', default=True,
+            help='Tells Django not to run a worker thread; you\'ll need to run one separately.')
+        parser.add_argument('--noasgi', action='store_false', dest='use_asgi', default=True,
+            help='Run the old WSGI-based runserver rather than the ASGI-based one')
+        parser.add_argument('--http_timeout', action='store', dest='http_timeout', type=int, default=60,
+            help='Specify the daphne http_timeout interval in seconds (default: 60)')
+        parser.add_argument('--websocket_handshake_timeout', action='store', dest='websocket_handshake_timeout',
             type=int, default=5,
             help='Specify the daphne websocket_handshake_timeout interval in seconds (default: 5)')
-    )
 
     def handle(self, *args, **options):
         self.verbosity = options.get("verbosity", 1)
@@ -53,13 +51,13 @@ class Command(RunserverCommand):
         )
         # Run checks
         self.stdout.write("Performing system checks...\n\n")
-        self.validate(display_num_errors=True)
-        #self.check_migrations()
+        self.check(display_num_errors=True)
+        self.check_migrations()
         # Print helpful text
         quit_command = 'CTRL-BREAK' if sys.platform == 'win32' else 'CONTROL-C'
         now = datetime.datetime.now().strftime('%B %d, %Y - %X')
         if six.PY2:
-            now = now.decode(DEFAULT_LOCALE_ENCODING)
+            now = now.decode(get_system_encoding())
         self.stdout.write(now)
         self.stdout.write((
             "Django version %(version)s, using settings %(settings)r\n"
@@ -151,7 +149,7 @@ class Command(RunserverCommand):
         if static files should be served. Otherwise just returns the default
         handler.
         """
-        staticfiles_installed = app_is_installed("django.contrib.staticfiles")
+        staticfiles_installed = apps.is_installed("django.contrib.staticfiles")
         use_static_handler = options.get('use_static_handler', staticfiles_installed)
         insecure_serving = options.get('insecure_serving', False)
         if use_static_handler and (settings.DEBUG or insecure_serving):

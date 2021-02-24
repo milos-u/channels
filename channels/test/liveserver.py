@@ -2,19 +2,18 @@ import multiprocessing
 
 import django
 from daphne.server import Server
+from django.apps import apps
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 from django.db.utils import load_backend
 from django.test.testcases import TransactionTestCase
-#from django.test.utils import modify_settings, override_settings
-from django.test.utils import override_settings
+from django.test.utils import modify_settings, override_settings
 from twisted.internet import reactor
 
 from .. import DEFAULT_CHANNEL_LAYER
 from ..asgi import ChannelLayerManager
 from ..staticfiles import StaticFilesConsumer
 from ..worker import Worker, WorkerGroup
-from ..utils import app_is_installed
 
 # NOTE: We use ChannelLayerManager to prevent layer instance sharing
 # between forked process.  Some layers implementations create
@@ -61,9 +60,9 @@ class ProcessSetup(multiprocessing.Process):
             overridden = override_settings(**self.overridden_settings)
             overridden.enable()
 
-        #if self.modified_settings:
-        #    modified = modify_settings(self.modified_settings)
-        #    modified.enable()
+        if self.modified_settings:
+            modified = modify_settings(self.modified_settings)
+            modified.enable()
 
 
 class WorkerProcess(ProcessSetup):
@@ -86,7 +85,7 @@ class WorkerProcess(ProcessSetup):
             self.common_setup()
             channel_layers = ChannelLayerManager()
             channel_layer = channel_layers.make_test_backend(DEFAULT_CHANNEL_LAYER)
-            if self.serve_static and app_is_installed('django.contrib.staticfiles'):
+            if self.serve_static and apps.is_installed('django.contrib.staticfiles'):
                 channel_layer.router.check_default(http_consumer=StaticFilesConsumer())
             else:
                 channel_layer.router.check_default()
