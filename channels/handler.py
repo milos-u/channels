@@ -12,7 +12,8 @@ from django import http
 from django.conf import settings
 from django.core import signals
 from django.core.handlers import base
-from django.http import HttpResponseSendFile, HttpResponse, HttpResponseServerError
+from django.http import HttpResponse, HttpResponseServerError
+from django.http.response import HttpResponseSendFileMixin
 from django.utils import datastructures
 from django.utils import six
 from django.utils.functional import cached_property
@@ -143,7 +144,7 @@ class AsgiRequest(http.HttpRequest):
                 if not chunk.get("more_content", False):
                     break
         assert isinstance(self._body, six.binary_type), "Body is not bytes"
-        if self.META.has_key('CONTENT_TYPE'):
+        if 'CONTENT_TYPE' in self.META:
             self.META['CONTENT_TYPE'] = str(self.META['CONTENT_TYPE'])
         # Add a stream-a-like for the body
         self._stream = BytesIO(self._body)
@@ -228,7 +229,7 @@ class AsgiHandler(base.BaseHandler):
                 try:
                     response = self.get_response(request)
                     # Fix chunk size on file responses
-                    if isinstance(response, HttpResponseSendFile):
+                    if isinstance(response, HttpResponseSendFileMixin):
                         response.block_size = 1024 * 512
                 except AsgiRequest.ResponseLater:
                     # The view has promised something else
@@ -305,7 +306,7 @@ class AsgiHandler(base.BaseHandler):
             "headers": response_headers,
         }
         # Streaming responses need to be pinned to their iterator
-        if isinstance(response, HttpResponseSendFile):
+        if isinstance(response, HttpResponseSendFileMixin) or response.streaming:
             # Access `__iter__` and not `streaming_content` directly in case
             # it has been overridden in a subclass.
             for part in response:
