@@ -17,7 +17,9 @@ def name_that_thing(thing):
             if thing.__class__ is not type and not issubclass(thing.__class__, type):
                 return name_that_thing(thing.__class__)
         if hasattr(thing, "__self__"):
-            return "%s.%s" % (thing.__self__.__module__, thing.__self__.__name__)
+            if hasattr(thing.__self__, "__name__"):
+                return "%s.%s" % (thing.__self__.__module__, thing.__self__.__name__)
+            return "%s.%s.%s" % (thing.__self__.__module__, thing.__self__.__class__.__name__, thing.__name__)
         if hasattr(thing, "__module__"):
             return "%s.%s" % (thing.__module__, thing.__name__)
     # Generic instance of a class
