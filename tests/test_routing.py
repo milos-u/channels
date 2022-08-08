@@ -1,348 +1,279 @@
-from __future__ import unicode_literals
+import pytest
+from django.core.exceptions import ImproperlyConfigured
+from django.urls import path, re_path
 
-from django.test import SimpleTestCase
-
-from channels.generic import BaseConsumer
-from channels.message import Message
-from channels.routing import Router, include, route, route_class
-from channels.utils import name_that_thing
+from channels.http import AsgiHandler
+from channels.routing import ChannelNameRouter, ProtocolTypeRouter, URLRouter
 
 
-# Fake consumers and routing sets that can be imported by string
-def consumer_1():
-    pass
+class MockApplication:
+
+    call_args = None
+
+    def __init__(self, return_value):
+        self.return_value = return_value
+        super().__init__()
+
+    async def __call__(self, scope, receive, send):
+        self.call_args = ((scope, receive, send), None)
+        return self.return_value
 
 
-def consumer_2():
-    pass
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_protocol_type_router():
+    """
+    Tests the ProtocolTypeRouter
+    """
+    # Test basic operation
+    router = ProtocolTypeRouter(
+        {
+            "websocket": MockApplication(return_value="ws"),
+            "http": MockApplication(return_value="http"),
+        }
+    )
+    assert await router({"type": "websocket"}, None, None) == "ws"
+    assert await router({"type": "http"}, None, None) == "http"
+    # Test defaulting to AsgiHandler
+    router = ProtocolTypeRouter({"websocket": MockApplication(return_value="ws")})
+    assert isinstance(router.application_mapping["http"], AsgiHandler)
+    # Test an unmatched type
+    with pytest.raises(ValueError):
+        await router({"type": "aprs"}, None, None)
+    # Test a scope with no type
+    with pytest.raises(KeyError):
+        await router({"tyyyype": "http"}, None, None)
 
 
-def consumer_3():
-    pass
+@pytest.mark.asyncio
+async def test_channel_name_router():
+    """
+    Tests the ChannelNameRouter
+    """
+    # Test basic operation
+    router = ChannelNameRouter(
+        {
+            "test": MockApplication(return_value=1),
+            "other_test": MockApplication(return_value=2),
+        }
+    )
+    assert await router({"channel": "test"}, None, None) == 1
+    assert await router({"channel": "other_test"}, None, None) == 2
+    # Test an unmatched channel
+    with pytest.raises(ValueError):
+        await router({"channel": "chat"}, None, None)
+    # Test a scope with no channel
+    with pytest.raises(ValueError):
+        await router({"type": "http"}, None, None)
 
 
-class TestClassConsumer(BaseConsumer):
-
-    method_mapping = {
-        "test.channel": "some_method",
+@pytest.mark.asyncio
+async def test_url_router():
+    """
+    Tests the URLRouter
+    """
+    posarg_app = MockApplication(return_value=4)
+    kwarg_app = MockApplication(return_value=5)
+    defaultkwarg_app = MockApplication(return_value=6)
+    router = URLRouter(
+        [
+            path("", MockApplication(return_value=1)),
+            path("foo/", MockApplication(return_value=2)),
+            re_path(r"bar", MockApplication(return_value=3)),
+            re_path(r"^posarg/(\d+)/$", posarg_app),
+            path("kwarg/<str:name>/", kwarg_app),
+            path("defaultkwargs/", defaultkwarg_app, kwargs={"default": 42}),
+        ]
+    )
+    # Valid basic matches
+    assert await router({"type": "http", "path": "/"}, None, None) == 1
+    assert await router({"type": "http", "path": "/foo/"}, None, None) == 2
+    assert await router({"type": "http", "path": "/bar/"}, None, None) == 3
+    assert await router({"type": "http", "path": "/bar/baz/"}, None, None) == 3
+    # Valid positional matches
+    assert await router({"type": "http", "path": "/posarg/123/"}, None, None) == 4
+    assert posarg_app.call_args[0][0]["url_route"] == {"args": ("123",), "kwargs": {}}
+    assert await router({"type": "http", "path": "/posarg/456/"}, None, None) == 4
+    assert posarg_app.call_args[0][0]["url_route"] == {"args": ("456",), "kwargs": {}}
+    # Valid keyword argument matches
+    assert await router({"type": "http", "path": "/kwarg/hello/"}, None, None) == 5
+    assert kwarg_app.call_args[0][0]["url_route"] == {
+        "args": tuple(),
+        "kwargs": {"name": "hello"},
+    }
+    assert await router({"type": "http", "path": "/kwarg/hellothere/"}, None, None) == 5
+    assert kwarg_app.call_args[0][0]["url_route"] == {
+        "args": tuple(),
+        "kwargs": {"name": "hellothere"},
+    }
+    # Valid default keyword arguments
+    assert await router({"type": "http", "path": "/defaultkwargs/"}, None, None) == 6
+    assert defaultkwarg_app.call_args[0][0]["url_route"] == {
+        "args": tuple(),
+        "kwargs": {"default": 42},
     }
 
-    def some_method(self, message, **kwargs):
-        pass
+    # Invalid matches
+    with pytest.raises(ValueError):
+        await router({"type": "http", "path": "/nonexistent/"}, None, None)
 
 
-chatroom_routing = [
-    route("websocket.connect", consumer_2, path=r"^/chat/(?P<room>[^/]+)/$"),
-    route("websocket.connect", consumer_3, path=r"^/mentions/$"),
-]
-
-chatroom_routing_nolinestart = [
-    route("websocket.connect", consumer_2, path=r"/chat/(?P<room>[^/]+)/$"),
-    route("websocket.connect", consumer_3, path=r"/mentions/$"),
-]
-
-class_routing = [
-    route_class(TestClassConsumer, path=r"^/foobar/$"),
-]
-
-
-class RoutingTests(SimpleTestCase):
+@pytest.mark.asyncio
+async def test_url_router_nesting():
     """
-    Tests that the router's routing code works correctly.
+    Tests that nested URLRouters add their keyword captures together.
     """
-
-    def assertRoute(self, router, channel, content, consumer, kwargs=None):
-        """
-        Asserts that asking the `router` to route the `content` as a message
-        from `channel` means it returns consumer `consumer`, optionally
-        testing it also returns `kwargs` to be passed in
-
-        Use `consumer` = None to assert that no route is found.
-        """
-        message = Message(content, channel, channel_layer="fake channel layer")
-        match = router.match(message)
-        if match is None:
-            if consumer is None:
-                return
-            else:
-                self.fail("No route found for %s on %s; expecting %s" % (
-                    content,
-                    channel,
-                    name_that_thing(consumer),
-                ))
-        else:
-            mconsumer, mkwargs = match
-            if consumer is None:
-                self.fail("Route found for %s on %s; expecting no route." % (
-                    content,
-                    channel,
-                ))
-            self.assertEqual(consumer, mconsumer, "Route found for %s on %s; but wrong consumer (%s not %s)." % (
-                content,
-                channel,
-                name_that_thing(mconsumer),
-                name_that_thing(consumer),
-            ))
-            if kwargs is not None:
-                self.assertEqual(kwargs, mkwargs, "Route found for %s on %s; but wrong kwargs (%s not %s)." % (
-                    content,
-                    channel,
-                    mkwargs,
-                    kwargs,
-                ))
-
-    def test_assumption(self):
-        """
-        Ensures the test consumers don't compare equal, as if this ever happens
-        this test file will pass and miss most bugs.
-        """
-        self.assertEqual(consumer_1, consumer_1)
-        self.assertNotEqual(consumer_1, consumer_2)
-        self.assertNotEqual(consumer_1, consumer_3)
-
-    def test_dict(self):
-        """
-        Tests dict expansion
-        """
-        router = Router({
-            "http.request": consumer_1,
-            "http.disconnect": consumer_2,
-        })
-        self.assertRoute(
-            router,
-            channel="http.request",
-            content={},
-            consumer=consumer_1,
-            kwargs={},
+    test_app = MockApplication(return_value=1)
+    inner_router = URLRouter(
+        [
+            re_path(r"^book/(?P<book>[\w\-]+)/page/(?P<page>\d+)/$", test_app),
+            re_path(r"^test/(\d+)/$", test_app),
+        ]
+    )
+    outer_router = URLRouter(
+        [
+            re_path(
+                r"^universe/(?P<universe>\d+)/author/(?P<author>\w+)/", inner_router
+            ),
+            re_path(r"^positional/(\w+)/", inner_router),
+        ]
+    )
+    assert (
+        await outer_router(
+            {
+                "type": "http",
+                "path": "/universe/42/author/andrewgodwin/book/channels-guide/page/10/",
+            },
+            None,
+            None,
         )
-        self.assertRoute(
-            router,
-            channel="http.request",
-            content={"path": "/chat/"},
-            consumer=consumer_1,
-            kwargs={},
-        )
-        self.assertRoute(
-            router,
-            channel="http.disconnect",
-            content={},
-            consumer=consumer_2,
-            kwargs={},
-        )
+        == 1
+    )
+    assert test_app.call_args[0][0]["url_route"] == {
+        "args": (),
+        "kwargs": {
+            "book": "channels-guide",
+            "author": "andrewgodwin",
+            "page": "10",
+            "universe": "42",
+        },
+    }
 
-    def test_filters(self):
-        """
-        Tests that filters catch things correctly.
-        """
-        router = Router([
-            route("http.request", consumer_1, path=r"^/chat/$"),
-            route("http.disconnect", consumer_2),
-            route("http.request", consumer_3),
-        ])
-        # Filter hit
-        self.assertRoute(
-            router,
-            channel="http.request",
-            content={"path": "/chat/"},
-            consumer=consumer_1,
-            kwargs={},
+    assert (
+        await outer_router(
+            {"type": "http", "path": "/positional/foo/test/3/"}, None, None
         )
-        # Fall-through
-        self.assertRoute(
-            router,
-            channel="http.request",
-            content={},
-            consumer=consumer_3,
-            kwargs={},
+        == 1
+    )
+    assert test_app.call_args[0][0]["url_route"] == {"args": ("foo", "3"), "kwargs": {}}
+
+
+@pytest.mark.asyncio
+async def test_url_router_nesting_path():
+    """
+    Tests that nested URLRouters add their keyword captures together when used
+    with path().
+    """
+    from django.urls import path
+
+    test_app = MockApplication(return_value=1)
+    inner_router = URLRouter([path("test/<int:page>/", test_app)])
+
+    def asgi_middleware(inner):
+        # Some middleware which hides the fact that we have an inner URLRouter
+        async def app(scope, receive, send):
+            return await inner(scope, receive, send)
+
+        app._path_routing = True
+        return app
+
+    outer_router = URLRouter(
+        [path("number/<int:number>/", asgi_middleware(inner_router))]
+    )
+
+    assert await inner_router({"type": "http", "path": "/test/3/"}, None, None) == 1
+    assert (
+        await outer_router({"type": "http", "path": "/number/42/test/3/"}, None, None)
+        == 1
+    )
+    assert test_app.call_args[0][0]["url_route"] == {
+        "args": (),
+        "kwargs": {"number": 42, "page": 3},
+    }
+    with pytest.raises(ValueError):
+        assert await outer_router(
+            {"type": "http", "path": "/number/42/test/3/bla/"}, None, None
         )
-        self.assertRoute(
-            router,
-            channel="http.request",
-            content={"path": "/liveblog/"},
-            consumer=consumer_3,
-            kwargs={},
+    with pytest.raises(ValueError):
+        assert await outer_router(
+            {"type": "http", "path": "/number/42/blub/"}, None, None
         )
 
-    def test_include(self):
-        """
-        Tests inclusion without a prefix
-        """
-        router = Router([
-            include("tests.test_routing.chatroom_routing"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/boom/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/chat/django/"},
-            consumer=consumer_2,
-            kwargs={"room": "django"},
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/mentions/"},
-            consumer=consumer_3,
-            kwargs={},
-        )
 
-    def test_route_class(self):
-        """
-        Tests route_class with/without prefix
-        """
-        router = Router([
-            include("tests.test_routing.class_routing"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/foobar/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="test.channel",
-            content={"path": "/foobar/"},
-            consumer=TestClassConsumer,
-        )
-        self.assertRoute(
-            router,
-            channel="test.channel",
-            content={"path": "/"},
-            consumer=None,
-        )
+@pytest.mark.asyncio
+async def test_url_router_path():
+    """
+    Tests that URLRouter also works with path()
+    """
+    from django.urls import path
 
-    def test_include_prefix(self):
-        """
-        Tests inclusion with a prefix
-        """
-        router = Router([
-            include("tests.test_routing.chatroom_routing", path="^/ws/v(?P<version>[0-9]+)"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/boom/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/chat/django/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/ws/v2/chat/django/"},
-            consumer=consumer_2,
-            kwargs={"version": "2", "room": "django"},
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/ws/v1/mentions/"},
-            consumer=consumer_3,
-            kwargs={"version": "1"},
-        )
-        # Check it works without the ^s too.
-        router = Router([
-            include("tests.test_routing.chatroom_routing_nolinestart", path="/ws/v(?P<version>[0-9]+)"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/ws/v2/chat/django/"},
-            consumer=consumer_2,
-            kwargs={"version": "2", "room": "django"},
-        )
+    kwarg_app = MockApplication(return_value=3)
+    router = URLRouter(
+        [
+            path("", MockApplication(return_value=1)),
+            path("foo/", MockApplication(return_value=2)),
+            path("author/<name>/", kwarg_app),
+            path("year/<int:year>/", kwarg_app),
+        ]
+    )
+    # Valid basic matches
+    assert await router({"type": "http", "path": "/"}, None, None) == 1
+    assert await router({"type": "http", "path": "/foo/"}, None, None) == 2
+    # Named without typecasting
+    assert (
+        await router({"type": "http", "path": "/author/andrewgodwin/"}, None, None) == 3
+    )
+    assert kwarg_app.call_args[0][0]["url_route"] == {
+        "args": tuple(),
+        "kwargs": {"name": "andrewgodwin"},
+    }
+    # Named with typecasting
+    assert await router({"type": "http", "path": "/year/2012/"}, None, None) == 3
+    assert kwarg_app.call_args[0][0]["url_route"] == {
+        "args": tuple(),
+        "kwargs": {"year": 2012},
+    }
+    # Invalid matches
+    with pytest.raises(ValueError):
+        await router({"type": "http", "path": "/nonexistent/"}, None, None)
 
-    def test_positional_pattern(self):
-        """
-        Tests that regexes with positional groups are rejected.
-        """
-        with self.assertRaises(ValueError):
-            Router([
-                route("http.request", consumer_1, path=r"^/chat/([^/]+)/$"),
-            ])
 
-    def test_mixed_unicode_bytes(self):
-        """
-        Tests that having the message key be bytes and pattern unicode (or vice-versa)
-        still works.
-        """
-        # Unicode patterns, byte message
-        router = Router([
-            route("websocket.connect", consumer_1, path="^/foo/"),
-            include("tests.test_routing.chatroom_routing", path="^/ws/v(?P<version>[0-9]+)"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": b"/boom/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": b"/foo/"},
-            consumer=consumer_1,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": b"/ws/v2/chat/django/"},
-            consumer=consumer_2,
-            kwargs={"version": "2", "room": "django"},
-        )
-        # Byte patterns, unicode message
-        router = Router([
-            route("websocket.connect", consumer_1, path=b"^/foo/"),
-            include("tests.test_routing.chatroom_routing", path=b"^/ws/v(?P<version>[0-9]+)"),
-        ])
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/boom/"},
-            consumer=None,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/foo/"},
-            consumer=consumer_1,
-        )
-        self.assertRoute(
-            router,
-            channel="websocket.connect",
-            content={"path": "/ws/v2/chat/django/"},
-            consumer=consumer_2,
-            kwargs={"version": "2", "room": "django"},
-        )
+@pytest.mark.asyncio
+async def test_path_remaining():
+    """
+    Resolving continues in outer router if an inner router has no matching
+    routes
+    """
+    inner_router = URLRouter([path("no-match/", MockApplication(return_value=1))])
+    test_app = MockApplication(return_value=2)
+    outer_router = URLRouter(
+        [path("prefix/", inner_router), path("prefix/stuff/", test_app)]
+    )
+    outermost_router = URLRouter([path("", outer_router)])
 
-    def test_channels(self):
-        """
-        Tests that the router reports channels to listen on correctly
-        """
-        router = Router([
-            route("http.request", consumer_1, path=r"^/chat/$"),
-            route("http.disconnect", consumer_2),
-            route("http.request", consumer_3),
-            route_class(TestClassConsumer),
-        ])
-        # Initial check
-        self.assertEqual(
-            router.channels,
-            {"http.request", "http.disconnect", "test.channel"},
-        )
-        # Dynamically add route, recheck
-        router.add_route(route("websocket.receive", consumer_1))
-        self.assertEqual(
-            router.channels,
-            {"http.request", "http.disconnect", "websocket.receive", "test.channel"},
-        )
+    assert (
+        await outermost_router({"type": "http", "path": "/prefix/stuff/"}, None, None)
+        == 2
+    )
+
+
+def test_invalid_routes():
+    """
+    Test URLRouter route validation
+    """
+    from django.urls import include
+
+    with pytest.raises(ImproperlyConfigured) as exc:
+        URLRouter([path("", include([]))])
+
+    assert "include() is not supported in URLRouter." in str(exc)

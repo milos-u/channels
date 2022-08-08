@@ -1,6 +1,220 @@
 Full release notes, with more details and upgrade information, are available at:
 https://channels.readthedocs.io/en/latest/releases
 
+3.0.5 (2022-06-24)
+------------------
+
+Channels 3.0.5 is a bugfix release in the 3.0 series.
+
+Please see the `Version 3.0.5 release notes
+<https://channels.readthedocs.io/en/latest/releases/3.0.5.html>`_ for full
+details.
+
+
+3.0.4 (2021-07-11)
+------------------
+
+Channels 3.0.4 is a bugfix release in the 3.0 series.
+
+Please see the `Version 3.0.4 release notes
+<https://channels.readthedocs.io/en/latest/releases/3.0.4.html>`_ for full
+details.
+
+
+3.0.3 (2020-12-28)
+------------------
+
+* Fixed a bug in Channels 3.0 where the legacy ``channels.http.AsgiHandler``
+  would not correctly isolate per-request scopes.
+
+  This is a security release for CVE-2020-35681. Please see the `Version 3.0.3
+  release notes
+  <https://channels.readthedocs.io/en/latest/releases/3.0.3.html>`_ for full
+  details.
+
+
+3.0.2 (2020-11-9)
+-----------------
+
+* Fixes a bug in Channels 3.0 where ``StaticFilesWrapper`` was not updated to
+  the ASGI 3 single-callable interface.
+
+* Users of the ``runworker`` command should ensure to update ``asgiref`` to
+  version 3.3.1 or later.
+
+
+3.0.1 (2020-11-4)
+-----------------
+
+* Fixes a bug in Channels 3.0 where ``SessionMiddleware`` would not correctly
+  isolate per-instance scopes.
+
+
+3.0.0 (2020-10-30)
+------------------
+
+Updated to ASGI v3, and added support for Django 3.0+.
+
+This is a major version change requiring updates to consumers and middleware.
+Please see the full `Version 3.0.0 release notes
+<https://channels.readthedocs.io/en/latest/releases/3.0.0.html>`_ for details.
+
+
+2.4.0 (2019-12-18)
+------------------
+
+* Wraps session save calls in ``database_sync_to_async()``, for compatibility
+  with Django 3.0's ``async_unsafe()`` checks.
+
+* Drops compatibility with all Django versions lower than 2.2.
+
+
+2.3.1 (2019-10-23)
+------------------
+
+* Adds compatibility with Python 3.8.
+
+
+2.3.0 (2019-09-18)
+------------------
+
+* Adjusted ``AsgiHandler`` HTTP body handling to use a spooled temporary file,
+  rather than reading the whole request body into memory.
+
+  As a result, ``AsgiRequest.__init__()`` is adjusted to expect a file-like
+  ``stream``, rather than the whole ``body`` as bytes. Test cases instantiating
+  requests directly will likely need to be updated to wrap the provided body
+  in, e.g., `io.BytesIO`.
+
+
+2.2.0 (2019-04-14)
+------------------
+
+* Updated requirements for ASGI v3 and Daphne 2.3.
+
+
+2.1.7 (2019-01-31)
+------------------
+
+* HTTP request body size limit is now enforced
+
+* database_sync_to_async now closes old connections before it runs code
+
+* Auth middleware closes old connections before it runs
+
+
+2.1.6 (2018-12-08)
+------------------
+
+* HttpCommunicator now extracts query strings correctly
+
+* AsyncHttpConsumer provides channel layer attributes
+
+* Prevent late-Daphne import errors
+
+
+2.1.5 (2018-10-22)
+------------------
+
+* Django middleware caching now works on Django 1.11 and Django 2.0.
+  The previous release only ran on 2.1.
+
+
+2.1.4 (2018-10-19)
+------------------
+
+* Django middleware is now cached rather than instantiated per request
+  resulting in a significant speed improvement
+
+* ChannelServerLiveTestCase now serves static files again
+
+* Improved error message resulting from bad Origin headers
+
+* runserver logging now goes through the Django logging framework
+
+* Generic consumers can now have non-default channel layers
+
+* Improved error when accessing scope['user'] before it's ready
+
+
+2.1.3 (2018-08-16)
+------------------
+
+* An ALLOWED_ORIGINS value of "*" will now also allow requests without a Host
+  header at all (especially important for tests)
+
+* The request.path value is now correct in cases when a server has SCRIPT_NAME
+  set
+
+* Errors that happen inside channel listeners inside a runworker or Worker
+  class are now raised rather than suppressed
+
+
+2.1.2 (2018-06-13)
+------------------
+
+* AsyncHttpConsumer now has a disconnect() method you can override
+
+* Session and authentication middleware is now non-blocking.
+
+* URL routing context now includes default arguments from the URLconf.
+
+* The FORCE_SCRIPT_NAME setting is now respected in ASGI mode.
+
+* ALLOWED_HOSTS is now set correctly during LiveServerTests.
+
+
+2.1.1 (2018-04-18)
+------------------
+
+* The scope["user"] object is no longer a lazy object, as this conflicts with
+  any async-based consumers.
+
+
+2.1.0 (2018-04-11)
+------------------
+
+* Async HTTP Consumers and WebSocket Consumers both gained new functionality
+  (groups, subprotocols, and an async HTTP variant)
+
+* URLRouters now allow nesting
+
+* Async login and logout functions for sessions
+
+* Expiry and groups in the in-memory channel layer
+
+* Improved Live Server test case
+
+* More powerful OriginValidator
+
+* Other small changes and fixes in the full release notes.
+
+
+2.0.2 (2018-02-08)
+------------------
+
+* SyncConsumer now terminates old database connections, and there is a new
+  database_sync_to_async wrapper to allow async connections to do the same.
+
+
+2.0.1 (2018-02-05)
+------------------
+
+* AsyncWebsocketConsumer and AsyncJsonWebsocketConsumer classes added
+
+* OriginValidator and AllowedHostsOriginValidator ASGI middleware is now available
+
+* URLRouter now correctly resolves long lists of URLs
+
+
+2.0.0 (2018-02-01)
+------------------
+
+* Major backwards-incompatible rewrite to move to an asyncio base and remove
+  the requirement to transport data over the network, as well as overhauled
+  generic consumers, test helpers, routing and more.
+
+
 1.1.6 (2017-06-28)
 ------------------
 
@@ -40,7 +254,7 @@ https://channels.readthedocs.io/en/latest/releases
 * ``enforce_ordering`` now works correctly with the new-style process-specific
   channels
 
-* ASGI channel layer versions are now explicitly checked for version compatability
+* ASGI channel layer versions are now explicitly checked for version compatibility
 
 
 1.1.2 (2017-04-01)

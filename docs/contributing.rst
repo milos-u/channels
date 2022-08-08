@@ -21,9 +21,7 @@ of the Channels sub-projects:
  * `Channels issues <https://github.com/django/channels/issues/>`_, for the Django integration and overall project efforts
  * `Daphne issues <https://github.com/django/daphne/issues/>`_, for the HTTP and Websocket termination
  * `asgiref issues <https://github.com/django/asgiref/issues/>`_, for the base ASGI library/memory backend
- * `asgi_redis issues <https://github.com/django/asgi_redis/issues/>`_, for the Redis channel backend
- * `asgi_rabbitmq <https://github.com/proofit404/asgi_rabbitmq/>`_, for the RabbitMQ channel backend
- * `asgi_ipc issues <https://github.com/django/asgi_ipc/issues/>`_, for the POSIX IPC channel backend
+ * `channels_redis issues <https://github.com/django/channels_redis/issues/>`_, for the Redis channel backend
 
 Issues are categorized by difficulty level:
 
@@ -58,24 +56,79 @@ one of them, pop into the IRC channel at ``#django-channels`` on Freenode or
 get in touch with Andrew directly at andrew@aeracode.org.
 
 
+How do I get started and run the tests?
+---------------------------------------
+
+First, you should first clone the git repository to a local directory:
+
+.. code-block:: sh
+
+    git clone https://github.com/django/channels.git channels
+
+Next, you may want to make a virtual environment to run the tests and develop
+in; you can use either ``virtualenvwrapper``, ``pipenv`` or just plain
+``virtualenv`` for this.
+
+Then, ``cd`` into the ``channels`` directory and install it editable into
+your environment:
+
+.. code-block:: sh
+
+    cd channels/
+    python -m pip install -e .[tests]
+
+Note the ``[tests]`` section there; that tells ``pip`` that you want to install
+the ``tests`` extra, which will bring in testing dependencies like
+``pytest-django``.
+
+Then, you can run the tests:
+
+.. code-block:: sh
+
+    pytest
+
+Also, there is a tox.ini file at the root of the repository. Example commands:
+
+.. code-block:: sh
+
+   $ tox -l
+   py36-dj11
+   py36-dj21
+   py36-dj22
+   py37-dj11
+   py37-dj21
+   py37-dj22
+
+   # run the test with Python 3.7, on Django 2.2 and Django master branch
+   $ tox -e py37-dj22 && tox -e py37-djmaster
+
+Note that tox can also forward arguments to pytest. When using pdb with pytest,
+forward the ``-s`` option to pytest as such:
+
+.. code-block:: sh
+
+   tox -e py37-dj22 -- -s
+
 Can you pay me for my time?
 ---------------------------
 
-Thanks to Mozilla, we have a reasonable budget to pay people for their time
-working on all of the above sorts of tasks and more. Generally, we'd prefer
-to fund larger projects (you can find these labelled as ``epic-project`` in the
-issues lists) to reduce the administrative overhead, but we're open to any
-proposal.
+Unfortunately, the Mozilla funds we previously had are exhausted, so we can
+no longer pay for contributions. Thanks to all who participated!
 
-If you're interested in working on something and being paid, you'll need to
-draw up a short proposal and get in touch with the committee, discuss the work
-and your history with open-source contribution (we strongly prefer that you have
-a proven track record on at least a few things) and the amount you'd like to be paid.
 
-If you're interested in working on one of these tasks, get in touch with
-Andrew Godwin (andrew@aeracode.org) as a first point of contact; he can help
-talk you through what's involved, and help judge/refine your proposal before
-it goes to the committee.
+How do I do a release?
+----------------------
 
-Tasks not on any issues list can also be proposed; Andrew can help talk about them
-and if they would be sensible to do.
+If you have commit access, a release involves the following steps:
+
+* Create a new entry in the CHANGELOG.txt file and summarise the changes
+* Create a new release page in the docs under ``docs/releases`` and add the
+  changelog there with more information where necessary
+* Add a link to the new release notes in ``docs/releases/index.rst``
+* Set the new version in ``__init__.py``
+* Roll all of these up into a single commit and tag it with the new version
+  number. Push the commit and tag, and Travis will automatically build and
+  release the new version to PyPI as long as all tests pass.
+
+The release process for ``channels-redis`` and ``daphne`` is similar, but
+they don't have the two steps in ``docs/``.

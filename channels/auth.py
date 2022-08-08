@@ -1,106 +1,190 @@
-import functools
+from django.conf import settings
+from django.contrib.auth import (
+    BACKEND_SESSION_KEY,
+    HASH_SESSION_KEY,
+    SESSION_KEY,
+    _get_backends,
+    get_user_model,
+    load_backend,
+    user_logged_in,
+    user_logged_out,
+)
+from django.utils.crypto import constant_time_compare
+from django.utils.functional import LazyObject
 
-from django.contrib import auth
+from channels.db import database_sync_to_async
+from channels.middleware import BaseMiddleware
+from channels.sessions import CookieMiddleware, SessionMiddleware
 
-from .sessions import channel_and_http_session, channel_session, http_session
 
-
-def transfer_user(from_session, to_session):
+@database_sync_to_async
+def get_user(scope):
     """
-    Transfers user from HTTP session to channel session.
+    Return the user model instance associated with the given scope.
+    If no user is retrieved, return an instance of `AnonymousUser`.
     """
-    if auth.BACKEND_SESSION_KEY in from_session and \
-       auth.SESSION_KEY in from_session and \
-       auth.HASH_SESSION_KEY in from_session:
-        to_session[auth.BACKEND_SESSION_KEY] = from_session[auth.BACKEND_SESSION_KEY]
-        to_session[auth.SESSION_KEY] = from_session[auth.SESSION_KEY]
-        to_session[auth.HASH_SESSION_KEY] = from_session[auth.HASH_SESSION_KEY]
+    # postpone model import to avoid ImproperlyConfigured error before Django
+    # setup is complete.
+    from django.contrib.auth.models import AnonymousUser
+
+    if "session" not in scope:
+        raise ValueError(
+            "Cannot find session in scope. You should wrap your consumer in "
+            "SessionMiddleware."
+        )
+    session = scope["session"]
+    user = None
+    try:
+        user_id = _get_user_session_key(session)
+        backend_path = session[BACKEND_SESSION_KEY]
+    except KeyError:
+        pass
+    else:
+        if backend_path in settings.AUTHENTICATION_BACKENDS:
+            backend = load_backend(backend_path)
+            user = backend.get_user(user_id)
+            # Verify the session
+            if hasattr(user, "get_session_auth_hash"):
+                session_hash = session.get(HASH_SESSION_KEY)
+                session_hash_verified = session_hash and constant_time_compare(
+                    session_hash, user.get_session_auth_hash()
+                )
+                if not session_hash_verified:
+                    session.flush()
+                    user = None
+    return user or AnonymousUser()
 
 
-def channel_session_user(func):
+@database_sync_to_async
+def login(scope, user, backend=None):
     """
-    Presents a message.user attribute obtained from a user ID in the channel
-    session, rather than in the http_session. Turns on channel session implicitly.
+    Persist a user id and a backend in the request.
+    This way a user doesn't have to re-authenticate on every request.
+    Note that data set during the anonymous session is retained when the user
+    logs in.
     """
-    @channel_session
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        # If we didn't get a session, then we don't get a user
-        if not hasattr(message, "channel_session"):
-            raise ValueError("Did not see a channel session to get auth from")
-        if message.channel_session is None:
-            # Inner import to avoid reaching into models before load complete
-            from django.contrib.auth.models import AnonymousUser
-            message.user = AnonymousUser()
-        # Otherwise, be a bit naughty and make a fake Request with just
-        # a "session" attribute (later on, perhaps refactor contrib.auth to
-        # pass around session rather than request)
+    if "session" not in scope:
+        raise ValueError(
+            "Cannot find session in scope. You should wrap your consumer in "
+            "SessionMiddleware."
+        )
+    session = scope["session"]
+    session_auth_hash = ""
+    if user is None:
+        user = scope.get("user", None)
+    if user is None:
+        raise ValueError(
+            "User must be passed as an argument or must be present in the scope."
+        )
+    if hasattr(user, "get_session_auth_hash"):
+        session_auth_hash = user.get_session_auth_hash()
+    if SESSION_KEY in session:
+        if _get_user_session_key(session) != user.pk or (
+            session_auth_hash
+            and not constant_time_compare(
+                session.get(HASH_SESSION_KEY, ""), session_auth_hash
+            )
+        ):
+            # To avoid reusing another user's session, create a new, empty
+            # session if the existing session corresponds to a different
+            # authenticated user.
+            session.flush()
+    else:
+        session.cycle_key()
+    try:
+        backend = backend or user.backend
+    except AttributeError:
+        backends = _get_backends(return_tuples=True)
+        if len(backends) == 1:
+            _, backend = backends[0]
         else:
-            fake_request = type("FakeRequest", (object, ), {"session": message.channel_session})
-            message.user = auth.get_user(fake_request)
-        # Run the consumer
-        return func(message, *args, **kwargs)
-    return inner
+            raise ValueError(
+                "You have multiple authentication backends configured and "
+                "therefore must provide the `backend` "
+                "argument or set the `backend` attribute on the user."
+            )
+    session[SESSION_KEY] = user._meta.pk.value_to_string(user)
+    session[BACKEND_SESSION_KEY] = backend
+    session[HASH_SESSION_KEY] = session_auth_hash
+    scope["user"] = user
+    # note this does not reset the CSRF_COOKIE/Token
+    user_logged_in.send(sender=user.__class__, request=None, user=user)
 
 
-def http_session_user(func):
+@database_sync_to_async
+def logout(scope):
     """
-    Wraps a HTTP or WebSocket consumer (or any consumer of messages
-    that provides a "COOKIES" attribute) to provide both a "session"
-    attribute and a "user" attibute, like AuthMiddleware does.
-
-    This runs http_session() to get a session to hook auth off of.
-    If the user does not have a session cookie set, both "session"
-    and "user" will be None.
+    Remove the authenticated user's ID from the request and flush their session
+    data.
     """
-    @http_session
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        # If we didn't get a session, then we don't get a user
-        if not hasattr(message, "http_session"):
-            raise ValueError("Did not see a http session to get auth from")
-        if message.http_session is None:
-            # Inner import to avoid reaching into models before load complete
-            from django.contrib.auth.models import AnonymousUser
-            message.user = AnonymousUser()
-        # Otherwise, be a bit naughty and make a fake Request with just
-        # a "session" attribute (later on, perhaps refactor contrib.auth to
-        # pass around session rather than request)
-        else:
-            fake_request = type("FakeRequest", (object, ), {"session": message.http_session})
-            message.user = auth.get_user(fake_request)
-        # Run the consumer
-        return func(message, *args, **kwargs)
-    return inner
+    # postpone model import to avoid ImproperlyConfigured error before Django
+    # setup is complete.
+    from django.contrib.auth.models import AnonymousUser
+
+    if "session" not in scope:
+        raise ValueError(
+            "Login cannot find session in scope. You should wrap your "
+            "consumer in SessionMiddleware."
+        )
+    session = scope["session"]
+    # Dispatch the signal before the user is logged out so the receivers have a
+    # chance to find out *who* logged out.
+    user = scope.get("user", None)
+    if hasattr(user, "is_authenticated") and not user.is_authenticated:
+        user = None
+    if user is not None:
+        user_logged_out.send(sender=user.__class__, request=None, user=user)
+    session.flush()
+    if "user" in scope:
+        scope["user"] = AnonymousUser()
 
 
-def channel_session_user_from_http(func):
-    """
-    Decorator that automatically transfers the user from HTTP sessions to
-    channel-based sessions, and returns the user as message.user as well.
-    Useful for things that consume e.g. websocket.connect
-    """
-    @http_session_user
-    @channel_session
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        if message.http_session is not None:
-            transfer_user(message.http_session, message.channel_session)
-        return func(message, *args, **kwargs)
-    return inner
+def _get_user_session_key(session):
+    # This value in the session is always serialized to a string, so we need
+    # to convert it back to Python whenever we access it.
+    return get_user_model()._meta.pk.to_python(session[SESSION_KEY])
 
 
-def channel_and_http_session_user_from_http(func):
+class UserLazyObject(LazyObject):
     """
-    Decorator that automatically transfers the user from HTTP sessions to
-    channel-based sessions, rehydrates the HTTP session, and returns the
-    user as message.user as well.
+    Throw a more useful error message when scope['user'] is accessed before
+    it's resolved
     """
-    @http_session_user
-    @channel_and_http_session
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        if message.http_session is not None:
-            transfer_user(message.http_session, message.channel_session)
-        return func(message, *args, **kwargs)
-    return inner
+
+    def _setup(self):
+        raise ValueError("Accessing scope user before it is ready.")
+
+
+class AuthMiddleware(BaseMiddleware):
+    """
+    Middleware which populates scope["user"] from a Django session.
+    Requires SessionMiddleware to function.
+    """
+
+    def populate_scope(self, scope):
+        # Make sure we have a session
+        if "session" not in scope:
+            raise ValueError(
+                "AuthMiddleware cannot find session in scope. "
+                "SessionMiddleware must be above it."
+            )
+        # Add it to the scope if it's not there already
+        if "user" not in scope:
+            scope["user"] = UserLazyObject()
+
+    async def resolve_scope(self, scope):
+        scope["user"]._wrapped = await get_user(scope)
+
+    async def __call__(self, scope, receive, send):
+        scope = dict(scope)
+        # Scope injection/mutation per this middleware's needs.
+        self.populate_scope(scope)
+        # Grab the finalized/resolved scope
+        await self.resolve_scope(scope)
+
+        return await super().__call__(scope, receive, send)
+
+
+# Handy shortcut for applying all three layers at once
+def AuthMiddlewareStack(inner):
+    return CookieMiddleware(SessionMiddleware(AuthMiddleware(inner)))

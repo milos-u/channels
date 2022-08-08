@@ -17,14 +17,28 @@ Quick Setup
 
 Fork, then clone the repo:
 
+.. code-block:: sh
+
     git clone git@github.com:your-username/channels.git
 
 Make sure the tests pass:
 
-    tox
+.. code-block:: sh
+
+    python -m pip install -e .[tests]
+    pytest
 
 Make your change. Add tests for your change. Make the tests pass:
 
-    tox
+.. code-block:: sh
+
+    pytest
+
+Make sure your code conforms to the coding style:
+
+.. code-block:: sh
+
+    black ./channels ./tests
+    isort --check-only --diff --recursive ./channels ./tests
 
 Push to your fork and `submit a pull request <https://github.com/django/channels/compare/>`_.

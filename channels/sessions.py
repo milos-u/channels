@@ -1,249 +1,268 @@
-import functools
-import hashlib
+import datetime
+import time
 from importlib import import_module
 
 from django.conf import settings
-from django.contrib.sessions.backends import signed_cookies
-from django.contrib.sessions.backends.base import CreateError
+from django.contrib.sessions.backends.base import UpdateError
+from django.core.exceptions import SuspiciousOperation
+from django.http import parse_cookie
+from django.http.cookie import SimpleCookie
+from django.utils import timezone
+from django.utils.encoding import force_str
+from django.utils.functional import LazyObject
 
-from .exceptions import ConsumeLater
-from .handler import AsgiRequest
-from .message import Message
+from channels.db import database_sync_to_async
+
+try:
+    from django.utils.http import http_date
+except ImportError:
+    from django.utils.http import cookie_date as http_date
 
 
-def session_for_reply_channel(reply_channel):
+class CookieMiddleware:
     """
-    Returns a session object tied to the reply_channel unicode string
-    passed in as an argument.
+    Extracts cookies from HTTP or WebSocket-style scopes and adds them as a
+    scope["cookies"] entry with the same format as Django's request.COOKIES.
     """
-    # We hash the whole reply channel name and add a prefix, to fit inside 32B
-    reply_name = reply_channel
-    hashed = hashlib.sha1(reply_name.encode("utf8")).hexdigest()
-    session_key = "chn" + hashed[:29]
-    # Make a session storage
-    session_engine = import_module(getattr(settings, "CHANNEL_SESSION_ENGINE", settings.SESSION_ENGINE))
-    if session_engine is signed_cookies:
-        raise ValueError("You cannot use channels session functionality with signed cookie sessions!")
-    # Force the instance to load in case it resets the session when it does
-    instance = session_engine.SessionStore(session_key=session_key)
-    instance._session.keys()
-    instance._session_key = session_key
-    return instance
 
+    def __init__(self, inner):
+        self.inner = inner
 
-def channel_session(func):
-    """
-    Provides a session-like object called "channel_session" to consumers
-    as a message attribute that will auto-persist across consumers with
-    the same incoming "reply_channel" value.
-
-    Use this to persist data across the lifetime of a connection.
-    """
-    @functools.wraps(func)
-    def inner(*args, **kwargs):
-        message = None
-        for arg in args[:2]:
-            if isinstance(arg, Message):
-                message = arg
-                break
-        if message is None:
-            raise ValueError('channel_session called without Message instance')
-        # Make sure there's NOT a channel_session already
-        if hasattr(message, "channel_session"):
-            try:
-                return func(*args, **kwargs)
-            finally:
-                # Persist session if needed
-                if message.channel_session.modified:
-                    message.channel_session.save()
-
-        # Make sure there's a reply_channel
-        if not message.reply_channel:
+    async def __call__(self, scope, receive, send):
+        # Check this actually has headers. They're a required scope key for HTTP and WS.
+        if "headers" not in scope:
             raise ValueError(
-                "No reply_channel sent to consumer; @channel_session " +
-                "can only be used on messages containing it."
+                "CookieMiddleware was passed a scope that did not have a headers key "
+                + "(make sure it is only passed HTTP or WebSocket connections)"
             )
-        # If the session does not already exist, save to force our
-        # session key to be valid.
-        session = session_for_reply_channel(message.reply_channel.name)
-        if not session.exists(session.session_key):
-            try:
-                session.save(must_create=True)
-            except CreateError:
-                # Session wasn't unique, so another consumer is doing the same thing
-                raise ConsumeLater()
-        message.channel_session = session
-        # Run the consumer
-        try:
-            return func(*args, **kwargs)
-        finally:
-            # Persist session if needed
-            if session.modified and not session.is_empty():
-                session.save()
-    return inner
-
-
-def wait_channel_name(reply_channel):
-    """
-    Given a reply_channel, returns a wait channel for it.
-    Replaces any ! with ? so process-specific channels become single-reader
-    channels.
-    """
-    return "__wait__.%s" % (reply_channel.replace("!", "?"), )
-
-
-def requeue_messages(message):
-    """
-    Requeue any pending wait channel messages for this socket connection back onto it's original channel
-    """
-    while True:
-        wait_channel = wait_channel_name(message.reply_channel.name)
-        channel, content = message.channel_layer.receive_many([wait_channel], block=False)
-        if channel:
-            original_channel = content.pop("original_channel")
-            try:
-                message.channel_layer.send(original_channel, content)
-            except message.channel_layer.ChannelFull:
-                raise message.channel_layer.ChannelFull(
-                    "Cannot requeue pending __wait__ channel message " +
-                    "back on to already full channel %s" % original_channel
-                )
+        # Go through headers to find the cookie one
+        for name, value in scope.get("headers", []):
+            if name == b"cookie":
+                cookies = parse_cookie(value.decode("latin1"))
+                break
         else:
-            break
+            # No cookie header found - add an empty default.
+            cookies = {}
+        # Return inner application
+        return await self.inner(dict(scope, cookies=cookies), receive, send)
 
+    @classmethod
+    def set_cookie(
+        cls,
+        message,
+        key,
+        value="",
+        max_age=None,
+        expires=None,
+        path="/",
+        domain=None,
+        secure=False,
+        httponly=False,
+        samesite="lax",
+    ):
+        """
+        Sets a cookie in the passed HTTP response message.
 
-def enforce_ordering(func=None, slight=False):
-    """
-    Enforces strict (all messages exactly ordered) ordering against a reply_channel.
-
-    Uses sessions to track ordering and socket-specific wait channels for unordered messages.
-    """
-    # Slight is deprecated
-    if slight:
-        raise ValueError("Slight ordering is now always on due to Channels changes. Please remove the decorator.")
-
-    # Main decorator
-    def decorator(func):
-        @channel_session
-        @functools.wraps(func)
-        def inner(message, *args, **kwargs):
-            # Make sure there's an order
-            if "order" not in message.content:
-                raise ValueError(
-                    "No `order` value in message; @enforce_ordering " +
-                    "can only be used on messages containing it."
-                )
-            order = int(message.content['order'])
-            # See what the current next order should be
-            next_order = message.channel_session.get("__channels_next_order", 0)
-            if order == next_order:
-                # Run consumer
-                func(message, *args, **kwargs)
-                # Mark next message order as available for running
-                message.channel_session["__channels_next_order"] = order + 1
-                message.channel_session.save()
-                message.channel_session.modified = False
-                requeue_messages(message)
+        ``expires`` can be:
+        - a string in the correct format,
+        - a naive ``datetime.datetime`` object in UTC,
+        - an aware ``datetime.datetime`` object in any time zone.
+        If it is a ``datetime.datetime`` object then ``max_age`` will be calculated.
+        """
+        value = force_str(value)
+        cookies = SimpleCookie()
+        cookies[key] = value
+        if expires is not None:
+            if isinstance(expires, datetime.datetime):
+                if timezone.is_aware(expires):
+                    expires = timezone.make_naive(expires, timezone.utc)
+                delta = expires - expires.utcnow()
+                # Add one second so the date matches exactly (a fraction of
+                # time gets lost between converting to a timedelta and
+                # then the date string).
+                delta = delta + datetime.timedelta(seconds=1)
+                # Just set max_age - the max_age logic will set expires.
+                expires = None
+                max_age = max(0, delta.days * 86400 + delta.seconds)
             else:
-                # Since out of order, enqueue message temporarily to wait channel for this socket connection
-                wait_channel = wait_channel_name(message.reply_channel.name)
-                message.content["original_channel"] = message.channel.name
-                try:
-                    message.channel_layer.send(wait_channel, message.content)
-                except message.channel_layer.ChannelFull:
-                    raise message.channel_layer.ChannelFull(
-                        "Cannot add unordered message to already " +
-                        "full __wait__ channel for socket %s" % message.reply_channel.name
-                    )
-                # Next order may have changed while this message was being processed
-                # Requeue messages if this has happened
-                if order == message.channel_session.load().get("__channels_next_order", 0):
-                    requeue_messages(message)
-
-        return inner
-    if func is not None:
-        return decorator(func)
-    else:
-        return decorator
-
-
-def http_session(func):
-    """
-    Wraps a HTTP or WebSocket connect consumer (or any consumer of messages
-    that provides a "cookies" or "get" attribute) to provide a "http_session"
-    attribute that behaves like request.session; that is, it's hung off of
-    a per-user session key that is saved in a cookie or passed as the
-    "session_key" GET parameter.
-
-    It won't automatically create and set a session cookie for users who
-    don't have one - that's what SessionMiddleware is for, this is a simpler
-    read-only version for more low-level code.
-
-    If a message does not have a session we can inflate, the "session" attribute
-    will be None, rather than an empty session you can write to.
-
-    Does not allow a new session to be set; that must be done via a view. This
-    is only an accessor for any existing session.
-    """
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        # Make sure there's NOT a http_session already
-        if hasattr(message, "http_session"):
-            try:
-                return func(message, *args, **kwargs)
-            finally:
-                # Persist session if needed (won't be saved if error happens)
-                if message.http_session is not None and message.http_session.modified:
-                    message.http_session.save()
-
-        try:
-            # We want to parse the WebSocket (or similar HTTP-lite) message
-            # to get cookies and GET, but we need to add in a few things that
-            # might not have been there.
-            if "method" not in message.content:
-                message.content['method'] = "FAKE"
-            request = AsgiRequest(message)
-        except Exception as e:
-            raise ValueError("Cannot parse HTTP message - are you sure this is a HTTP consumer? %s" % e)
-        # Make sure there's a session key
-        session_key = request.GET.get("session_key", None)
-        if session_key is None:
-            session_key = request.COOKIES.get(settings.SESSION_COOKIE_NAME, None)
-        # Make a session storage
-        if session_key:
-            session_engine = import_module(settings.SESSION_ENGINE)
-            session = session_engine.SessionStore(session_key=session_key)
+                cookies[key]["expires"] = expires
         else:
-            session = None
-        message.http_session = session
-        # Run the consumer
-        result = func(message, *args, **kwargs)
-        # Persist session if needed (won't be saved if error happens)
-        if session is not None and session.modified:
-            session.save()
-        return result
-    return inner
+            cookies[key]["expires"] = ""
+        if max_age is not None:
+            cookies[key]["max-age"] = max_age
+            # IE requires expires, so set it if hasn't been already.
+            if not expires:
+                cookies[key]["expires"] = http_date(time.time() + max_age)
+        if path is not None:
+            cookies[key]["path"] = path
+        if domain is not None:
+            cookies[key]["domain"] = domain
+        if secure:
+            cookies[key]["secure"] = True
+        if httponly:
+            cookies[key]["httponly"] = True
+        if samesite is not None:
+            assert samesite.lower() in [
+                "strict",
+                "lax",
+                "none",
+            ], "samesite must be either 'strict', 'lax' or 'none'"
+            cookies[key]["samesite"] = samesite
+        # Write out the cookies to the response
+        for c in cookies.values():
+            message.setdefault("headers", []).append(
+                (b"Set-Cookie", bytes(c.output(header=""), encoding="utf-8"))
+            )
+
+    @classmethod
+    def delete_cookie(cls, message, key, path="/", domain=None):
+        """
+        Deletes a cookie in a response.
+        """
+        return cls.set_cookie(
+            message,
+            key,
+            max_age=0,
+            path=path,
+            domain=domain,
+            expires="Thu, 01-Jan-1970 00:00:00 GMT",
+        )
 
 
-def channel_and_http_session(func):
+class InstanceSessionWrapper:
     """
-    Enables both the channel_session and http_session.
-
-    Stores the http session key in the channel_session on websocket.connect messages.
-    It will then hydrate the http_session from that same key on subsequent messages.
+    Populates the session in application instance scope, and wraps send to save
+    the session.
     """
-    @http_session
-    @channel_session
-    @functools.wraps(func)
-    def inner(message, *args, **kwargs):
-        # Store the session key in channel_session
-        if message.http_session is not None and settings.SESSION_COOKIE_NAME not in message.channel_session:
-            message.channel_session[settings.SESSION_COOKIE_NAME] = message.http_session.session_key
-        # Hydrate the http_session from session_key
-        elif message.http_session is None and settings.SESSION_COOKIE_NAME in message.channel_session:
-            session_engine = import_module(settings.SESSION_ENGINE)
-            session = session_engine.SessionStore(session_key=message.channel_session[settings.SESSION_COOKIE_NAME])
-            message.http_session = session
-        # Run the consumer
-        return func(message, *args, **kwargs)
-    return inner
+
+    # Message types that trigger a session save if it's modified
+    save_message_types = ["http.response.start"]
+
+    # Message types that can carry session cookies back
+    cookie_response_message_types = ["http.response.start"]
+
+    def __init__(self, scope, send):
+        self.cookie_name = settings.SESSION_COOKIE_NAME
+        self.session_store = import_module(settings.SESSION_ENGINE).SessionStore
+
+        self.scope = dict(scope)
+
+        if "session" in self.scope:
+            # There's already session middleware of some kind above us, pass
+            # that through
+            self.activated = False
+        else:
+            # Make sure there are cookies in the scope
+            if "cookies" not in self.scope:
+                raise ValueError(
+                    "No cookies in scope - SessionMiddleware needs to run "
+                    "inside of CookieMiddleware."
+                )
+            # Parse the headers in the scope into cookies
+            self.scope["session"] = LazyObject()
+            self.activated = True
+
+        # Override send
+        self.real_send = send
+
+    async def resolve_session(self):
+        session_key = self.scope["cookies"].get(self.cookie_name)
+        self.scope["session"]._wrapped = await database_sync_to_async(
+            self.session_store
+        )(session_key)
+
+    async def send(self, message):
+        """
+        Overridden send that also does session saves/cookies.
+        """
+        # Only save session if we're the outermost session middleware
+        if self.activated:
+            modified = self.scope["session"].modified
+            empty = self.scope["session"].is_empty()
+            # If this is a message type that we want to save on, and there's
+            # changed data, save it. We also save if it's empty as we might
+            # not be able to send a cookie-delete along with this message.
+            if (
+                message["type"] in self.save_message_types
+                and message.get("status", 200) != 500
+                and (modified or settings.SESSION_SAVE_EVERY_REQUEST)
+            ):
+                await database_sync_to_async(self.save_session)()
+                # If this is a message type that can transport cookies back to the
+                # client, then do so.
+                if message["type"] in self.cookie_response_message_types:
+                    if empty:
+                        # Delete cookie if it's set
+                        if settings.SESSION_COOKIE_NAME in self.scope["cookies"]:
+                            CookieMiddleware.delete_cookie(
+                                message,
+                                settings.SESSION_COOKIE_NAME,
+                                path=settings.SESSION_COOKIE_PATH,
+                                domain=settings.SESSION_COOKIE_DOMAIN,
+                            )
+                    else:
+                        # Get the expiry data
+                        if self.scope["session"].get_expire_at_browser_close():
+                            max_age = None
+                            expires = None
+                        else:
+                            max_age = self.scope["session"].get_expiry_age()
+                            expires_time = time.time() + max_age
+                            expires = http_date(expires_time)
+                        # Set the cookie
+                        CookieMiddleware.set_cookie(
+                            message,
+                            self.cookie_name,
+                            self.scope["session"].session_key,
+                            max_age=max_age,
+                            expires=expires,
+                            domain=settings.SESSION_COOKIE_DOMAIN,
+                            path=settings.SESSION_COOKIE_PATH,
+                            secure=settings.SESSION_COOKIE_SECURE or None,
+                            httponly=settings.SESSION_COOKIE_HTTPONLY or None,
+                            samesite=settings.SESSION_COOKIE_SAMESITE,
+                        )
+        # Pass up the send
+        return await self.real_send(message)
+
+    def save_session(self):
+        """
+        Saves the current session.
+        """
+        try:
+            self.scope["session"].save()
+        except UpdateError:
+            raise SuspiciousOperation(
+                "The request's session was deleted before the "
+                "request completed. The user may have logged "
+                "out in a concurrent request, for example."
+            )
+
+
+class SessionMiddleware:
+    """
+    Class that adds Django sessions (from HTTP cookies) to the
+    scope. Works with HTTP or WebSocket protocol types (or anything that
+    provides a "headers" entry in the scope).
+
+    Requires the CookieMiddleware to be higher up in the stack.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        """
+        Instantiate a session wrapper for this scope, resolve the session and
+        call the inner application.
+        """
+        wrapper = InstanceSessionWrapper(scope, send)
+
+        await wrapper.resolve_session()
+
+        return await self.inner(wrapper.scope, receive, wrapper.send)
+
+
+# Shortcut to include cookie middleware
+def SessionMiddlewareStack(inner):
+    return CookieMiddleware(SessionMiddleware(inner))

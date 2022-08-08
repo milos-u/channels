@@ -1,11 +1,11 @@
-__version__ = "1.1.6_4"
-
-default_app_config = 'channels.apps.ChannelsConfig'
-DEFAULT_CHANNEL_LAYER = 'default'
+__version__ = "3.0.5"
 
 try:
-    from .asgi import channel_layers  # NOQA isort:skip
-    from .channel import Channel, Group  # NOQA isort:skip
-    from .routing import route, route_class, include  # NOQA isort:skip
-except ImportError:  # No django installed, allow vars to be read
+    import django
+
+    if django.VERSION < (3, 2):
+        default_app_config = "channels.apps.ChannelsConfig"
+except ModuleNotFoundError:
     pass
+
+DEFAULT_CHANNEL_LAYER = "default"
