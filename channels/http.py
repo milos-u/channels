@@ -13,6 +13,7 @@ from django.core import signals
 from django.core.exceptions import RequestDataTooBig
 from django.core.handlers import base
 from django.http import FileResponse, HttpResponse, HttpResponseServerError
+from django.http.response import HttpResponseSendFileMixin
 from django.urls import set_script_prefix
 from django.utils.functional import cached_property
 
@@ -249,7 +250,7 @@ class AsgiHandler(base.BaseHandler):
         else:
             response = self.get_response(request)
             # Fix chunk size on file responses
-            if isinstance(response, FileResponse):
+            if isinstance(response, FileResponse) or isinstance(response, HttpResponseSendFileMixin):
                 response.block_size = 1024 * 512
         # Transform response into messages, which we yield back to caller
         for response_message in self.encode_response(response):
@@ -325,7 +326,7 @@ class AsgiHandler(base.BaseHandler):
             "headers": response_headers,
         }
         # Streaming responses need to be pinned to their iterator
-        if response.streaming:
+        if response.streaming or isinstance(response, HttpResponseSendFileMixin):
             # Access `__iter__` and not `streaming_content` directly in case
             # it has been overridden in a subclass.
             for part in response:

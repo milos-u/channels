@@ -9,7 +9,7 @@ def pytest_configure():
             "django.contrib.auth",
             "django.contrib.contenttypes",
             "django.contrib.sessions",
-            "django.contrib.admin",
+            "tlp.admin",
             "channels",
         ],
         SECRET_KEY="Not_a_secret_key",
