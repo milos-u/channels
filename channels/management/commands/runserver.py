@@ -51,10 +51,22 @@ class Command(RunserverCommand):
                 "seconds (default: 5)"
             ),
         )
+        parser.add_argument(
+            "--application-close-timeout",
+            action="store",
+            dest="application_close_timeout",
+            type=int,
+            default=10,
+            help=(
+                "Specify the daphne application_close_timeout interval in "
+                "seconds (default: 10)"
+            ),
+        )
 
     def handle(self, *args, **options):
         self.http_timeout = options.get("http_timeout", None)
         self.websocket_handshake_timeout = options.get("websocket_handshake_timeout", 5)
+        self.application_close_timeout = options.get("application_close_timeout", 10)
         # Check Channels is installed right
         if options["use_asgi"] and not hasattr(settings, "ASGI_APPLICATION"):
             raise CommandError(
@@ -110,6 +122,7 @@ class Command(RunserverCommand):
                 http_timeout=self.http_timeout,
                 root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
                 websocket_handshake_timeout=self.websocket_handshake_timeout,
+                application_close_timeout=self.application_close_timeout,
             ).run()
             logger.debug("Daphne exited")
         except KeyboardInterrupt:
