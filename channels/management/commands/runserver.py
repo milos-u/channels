@@ -2,8 +2,6 @@ import datetime
 import logging
 import sys
 
-from daphne.endpoints import build_endpoint_description_strings
-from daphne.server import Server
 from django.apps import apps
 from django.conf import settings
 from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler
@@ -16,9 +14,14 @@ from channels.routing import get_default_application
 logger = logging.getLogger("django.channels.server")
 
 
+VALID_BACKENDS = ("daphne", "uvicorn")
+
+
 class Command(RunserverCommand):
     protocol = "http"
-    server_cls = Server
+    # server_cls je nastaveny pri runtime v inner_run podle WS_SERVER_BACKEND;
+    # pro WSGI fallback (--noasgi) se vraci k RunserverCommand.server_cls.
+    server_cls = None
 
     def add_arguments(self, parser):
         super().add_arguments(parser)
@@ -29,6 +32,7 @@ class Command(RunserverCommand):
             default=True,
             help="Run the old WSGI-based runserver rather than the ASGI-based one",
         )
+        # ---- Daphne-specific args (ignorovany pokud backend=uvicorn) ----
         parser.add_argument(
             "--http_timeout",
             action="store",
@@ -36,8 +40,8 @@ class Command(RunserverCommand):
             type=int,
             default=None,
             help=(
-                "Specify the daphne http_timeout interval in seconds "
-                "(default: no timeout)"
+                "(daphne only) Specify the daphne http_timeout interval in "
+                "seconds (default: no timeout)"
             ),
         )
         parser.add_argument(
@@ -47,8 +51,8 @@ class Command(RunserverCommand):
             type=int,
             default=5,
             help=(
-                "Specify the daphne websocket_handshake_timeout interval in "
-                "seconds (default: 5)"
+                "(daphne only) Specify the daphne websocket_handshake_timeout "
+                "interval in seconds (default: 5)"
             ),
         )
         parser.add_argument(
@@ -58,15 +62,52 @@ class Command(RunserverCommand):
             type=int,
             default=10,
             help=(
-                "Specify the daphne application_close_timeout interval in "
-                "seconds (default: 10)"
+                "(daphne only) Specify the daphne application_close_timeout "
+                "interval in seconds (default: 10)"
+            ),
+        )
+        # ---- Uvicorn-specific args (ignorovany pokud backend=daphne) ----
+        parser.add_argument(
+            "--workers",
+            action="store",
+            dest="uvicorn_workers",
+            type=int,
+            default=1,
+            help=(
+                "(uvicorn only) worker process count. Default 1 — autoreload "
+                "spravne funguje jen s 1 workerem."
+            ),
+        )
+        parser.add_argument(
+            "--timeout-graceful-shutdown",
+            action="store",
+            dest="uvicorn_timeout_graceful_shutdown",
+            type=int,
+            default=5,
+            help=(
+                "(uvicorn only) graceful shutdown timeout in seconds "
+                "(default: 5 for dev runserver -- short so Ctrl+C is snappy "
+                "even with open browser WS; production service factory uses "
+                "30s for in-flight load cleanup)"
             ),
         )
 
     def handle(self, *args, **options):
+        self.backend = getattr(settings, "WS_SERVER_BACKEND", "daphne")
+        if self.backend not in VALID_BACKENDS:
+            raise CommandError(
+                "settings.WS_SERVER_BACKEND must be one of %r, got %r"
+                % (VALID_BACKENDS, self.backend)
+            )
         self.http_timeout = options.get("http_timeout", None)
-        self.websocket_handshake_timeout = options.get("websocket_handshake_timeout", 5)
+        self.websocket_handshake_timeout = options.get(
+            "websocket_handshake_timeout", 5
+        )
         self.application_close_timeout = options.get("application_close_timeout", 10)
+        self.uvicorn_workers = options.get("uvicorn_workers", 1)
+        self.uvicorn_timeout_graceful_shutdown = options.get(
+            "uvicorn_timeout_graceful_shutdown", 30
+        )
         # Check Channels is installed right
         if options["use_asgi"] and not hasattr(settings, "ASGI_APPLICATION"):
             raise CommandError(
@@ -86,6 +127,14 @@ class Command(RunserverCommand):
         self.check(display_num_errors=True)
         self.check_migrations()
         # Print helpful text
+        self._print_banner()
+
+        if self.backend == "uvicorn":
+            self._run_uvicorn(options)
+        else:
+            self._run_daphne(options)
+
+    def _print_banner(self):
         quit_command = "CTRL-BREAK" if sys.platform == "win32" else "CONTROL-C"
         now = datetime.datetime.now().strftime("%B %d, %Y - %X")
         self.stdout.write(now)
@@ -93,13 +142,14 @@ class Command(RunserverCommand):
             (
                 "Django version %(version)s, using settings %(settings)r\n"
                 "Starting ASGI/Channels version %(channels_version)s development server"
-                " at %(protocol)s://%(addr)s:%(port)s/\n"
+                " [%(backend)s] at %(protocol)s://%(addr)s:%(port)s/\n"
                 "Quit the server with %(quit_command)s.\n"
             )
             % {
                 "version": self.get_version(),
                 "channels_version": __version__,
                 "settings": settings.SETTINGS_MODULE,
+                "backend": self.backend,
                 "protocol": self.protocol,
                 "addr": "[%s]" % self.addr if self._raw_ipv6 else self.addr,
                 "port": self.port,
@@ -107,14 +157,14 @@ class Command(RunserverCommand):
             }
         )
 
-        # Launch server in 'main' thread. Signals are disabled as it's still
-        # actually a subthread under the autoreloader.
-        logger.debug("Daphne running, listening on %s:%s", self.addr, self.port)
+    def _run_daphne(self, options):
+        from daphne.endpoints import build_endpoint_description_strings
+        from daphne.server import Server
 
-        # build the endpoint description string from host/port options
+        logger.debug("Daphne running, listening on %s:%s", self.addr, self.port)
         endpoints = build_endpoint_description_strings(host=self.addr, port=self.port)
         try:
-            self.server_cls(
+            Server(
                 application=self.get_application(options),
                 endpoints=endpoints,
                 signal_handlers=not options["use_reloader"],
@@ -125,6 +175,32 @@ class Command(RunserverCommand):
                 application_close_timeout=self.application_close_timeout,
             ).run()
             logger.debug("Daphne exited")
+        except KeyboardInterrupt:
+            shutdown_message = options.get("shutdown_message", "")
+            if shutdown_message:
+                self.stdout.write(shutdown_message)
+            return
+
+    def _run_uvicorn(self, options):
+        import uvicorn
+
+        logger.debug("Uvicorn running, listening on %s:%s", self.addr, self.port)
+        config = uvicorn.Config(
+            app=self.get_application(options),
+            host=self.addr,
+            port=int(self.port),
+            workers=self.uvicorn_workers,
+            loop="auto",
+            ws="auto",
+            log_level="info",
+            timeout_graceful_shutdown=self.uvicorn_timeout_graceful_shutdown,
+            # Channels nepouziva ASGI lifespan protocol — vypneme, jinak
+            # Uvicorn loguje warning "ASGI 'lifespan' protocol appears unsupported".
+            lifespan="off",
+        )
+        try:
+            uvicorn.Server(config).run()
+            logger.debug("Uvicorn exited")
         except KeyboardInterrupt:
             shutdown_message = options.get("shutdown_message", "")
             if shutdown_message:
@@ -148,6 +224,9 @@ class Command(RunserverCommand):
     def log_action(self, protocol, action, details):
         """
         Logs various different kinds of requests to the console.
+
+        Volano jen z Daphne (action_logger=self.log_action). Uvicorn loguje
+        vlastnim access logem (formatovani je jine, sjednoceni je open item).
         """
         # HTTP requests
         if protocol == "http" and action == "complete":
